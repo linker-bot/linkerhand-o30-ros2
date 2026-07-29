@@ -142,9 +142,9 @@ sudo ip link set can0 up
 ## 5.4 下载
 
 ```bash
-$ mkdir -p Linker_Hand_O30_ROS2_SDK    # 创建工程目录
-$ cd Linker_Hand_O30_ROS2_SDK
-$ # 将 src 源码放入本目录
+$ mkdir -p Linker_Hand_O30_ROS2_SDK/src    # 创建工程目录
+$ cd Linker_Hand_O30_ROS2_SDK/src
+$ git clone https://github.com/linker-bot/linkerhand-o30-ros2.git
 ```
 
 ## 5.5 安装依赖与编译
