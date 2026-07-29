@@ -1,0 +1,5 @@
+# 设备 1 (F0802061329D3641) 左手
+SUBSYSTEM=="usb", ATTRS{idVendor}=="a8fa", ATTRS{idProduct}=="8598", OWNER="root", ATTRS{serial}=="F0802061329D3641", MODE="0666", GROUP="plugdev", SYMLINK+="LINKER_HAND_CANFD_LEFT"
+
+# 设备 2 (F080205B34AB4B31) 右手
+SUBSYSTEM=="usb", ATTRS{idVendor}=="a8fa", ATTRS{idProduct}=="8598", OWNER="root", ATTRS{serial}=="F080205B34AB4B31", MODE="0666", GROUP="plugdev", SYMLINK+="LINKERF_HAND_CANFD_RIGHT"
