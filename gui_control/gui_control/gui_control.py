@@ -44,17 +44,17 @@ class ROS2NodeManager(QObject):
             self.node.declare_parameter('hand_type', 'left')
             self.node.declare_parameter('hand_joint', 'L10')
             self.node.declare_parameter('topic_hz', 30)
-            self.node.declare_parameter('is_arc', False)
+            self.node.declare_parameter('is_rad', False)
             
             # 获取参数
             self.hand_type = self.node.get_parameter('hand_type').value
             self.hand_joint = self.node.get_parameter('hand_joint').value
             self.hz = self.node.get_parameter('topic_hz').value
-            self.is_arc = self.node.get_parameter('is_arc').value
+            self.is_rad = self.node.get_parameter('is_rad').value
             
-            if self.is_arc == True:
+            if self.is_rad == True:
                 # 创建发布者
-                self.publisher_arc = self.node.create_publisher(
+                self.publisher_rad = self.node.create_publisher(
                     JointState, f'/cb_{self.hand_type}_hand_control_cmd_rad', 10
                 )
             # 创建发布者
@@ -86,39 +86,39 @@ class ROS2NodeManager(QObject):
             self.status_updated.emit("error", "ROS2发布者未初始化")
             return
             
-        try:
-            self.joint_state.header.stamp = self.node.get_clock().now().to_msg()
-            self.joint_state.position = [float(pos) for pos in positions]
-            self.joint_state.velocity = [255.0] * len(positions)
-            self.joint_state.effort = [255.0] * len(positions)
-            # 如果有关节名称，添加到消息中
-            #hand_config = HandConfig.from_hand_type(self.hand_joint)
-            hand_config = _HAND_CONFIGS[self.hand_joint]
-            if len(hand_config.joint_names) == len(positions):
-                if hand_config.joint_names_en != None:
-                    self.joint_state.name = hand_config.joint_names_en
-                else:
-                    self.joint_state.name = hand_config.joint_names
-                
-            self.publisher.publish(self.joint_state)
+        #try:
+        self.joint_state.header.stamp = self.node.get_clock().now().to_msg()
+        self.joint_state.position = [float(pos) for pos in positions]
+        self.joint_state.velocity = [255.0] * len(positions)
+        self.joint_state.effort = [255.0] * len(positions)
+        # 如果有关节名称，添加到消息中
+        #hand_config = HandConfig.from_hand_type(self.hand_joint)
+        hand_config = _HAND_CONFIGS[self.hand_joint]
+        if len(hand_config.joint_names) == len(positions):
+            if hand_config.joint_names_en != None:
+                self.joint_state.name = hand_config.joint_names_en
+            else:
+                self.joint_state.name = hand_config.joint_names
+            
+        self.publisher.publish(self.joint_state)
 
-            # 如果开启弧度发布，将 0-255 范围值线性映射到 [min_rad, max_rad] 后发布
-            if self.is_arc:
-                if self.hand_type == "left":
-                    rad_positions = range_to_arc_left(positions, self.hand_joint)
-                else:
-                    rad_positions = range_to_arc_right(positions, self.hand_joint)
-                arc_state = JointState()
-                arc_state.header = Header()
-                arc_state.header.stamp = self.node.get_clock().now().to_msg()
-                arc_state.name = self.joint_state.name
-                arc_state.position = rad_positions
-                arc_state.velocity = [255.0] * len(positions)
-                arc_state.effort = [255.0] * len(positions)
-                self.publisher_arc.publish(arc_state)
-            self.status_updated.emit("info", "关节状态已发布")
-        except Exception as e:
-            self.status_updated.emit("error", f"发布失败: {str(e)}")
+        # 如果开启弧度发布，将 0-255 范围值线性映射到 [min_rad, max_rad] 后发布
+        if self.is_rad:
+            if self.hand_type == "left":
+                rad_positions = range_to_rad_left(positions, self.hand_joint)
+            else:
+                rad_positions = range_to_rad_right(positions, self.hand_joint)
+            arc_state = JointState()
+            arc_state.header = Header()
+            arc_state.header.stamp = self.node.get_clock().now().to_msg()
+            arc_state.name = self.joint_state.name
+            arc_state.position = rad_positions
+            arc_state.velocity = [255.0] * len(positions)
+            arc_state.effort = [255.0] * len(positions)
+            self.publisher_rad.publish(arc_state)
+        self.status_updated.emit("info", "关节状态已发布")
+        #except Exception as e:
+            #self.status_updated.emit("error", f"发布失败: {str(e)}")
 
     def publish_speed(self, val: int):
         joint_len = 0

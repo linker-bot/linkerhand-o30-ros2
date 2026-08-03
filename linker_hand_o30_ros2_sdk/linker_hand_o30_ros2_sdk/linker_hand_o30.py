@@ -20,7 +20,9 @@ from .utils.color_msg import ColorMsg
 
 INIT_POSE = [33, 23, 96, 176, 212, 162, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
 # 速度设置即便为0也不会停止，0映射电机速度8000,255映射电机速度12000
-INIT_VEL = [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+# INIT_VEL = [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+INIT_VEL = [200] * 20
+INIT_TORQUE = [200] * 20
 class LinkerHand(Node):
     def __init__(self, name):
         super().__init__(name)
@@ -49,7 +51,7 @@ class LinkerHand(Node):
         self.bitrate = self.get_parameter('bitrate').value
         self.dbitrate = self.get_parameter('dbitrate').value
         self.auto_setup = self.get_parameter('auto_setup').value
-        self.init_hand() # 初始化Linker Hand SDK（连接时自动实测有效关节）
+        self.init_hand() # 初始化Linker Hand SDK
         # 有效关节数以控制器实测结果为准（self.linker_hand.num_joints）
         self.num_joints = self.linker_hand.num_joints
         self.last_pose = [-1] * self.num_joints
@@ -89,6 +91,7 @@ class LinkerHand(Node):
             ColorMsg(msg="❌ 设备初始化失败，请检查硬件连接和配置参数是否正确", color="red")
             self.close()
         ColorMsg(msg=f"✅ {hand_info['产品型号']}-{hand_info['左右手']}设备初始化成功", color="green")
+        self.linker_hand.set_target_torque(INIT_TORQUE)
 
     def init_topics(self):
         self.hand_setting_sub = self.create_subscription(String,'/cb_hand_setting_cmd', self.hand_setting_cb, 10)
@@ -124,9 +127,11 @@ class LinkerHand(Node):
                     self.linker_hand.set_target_velocity(self.last_vel)
                     self.last_vel = [-1] * self.num_joints
                     time.sleep(0.002)
+                hand_vel = self.linker_hand.get_current_velocity()
+                hand_current = self.linker_hand.get_motor_current()
                 # 获取手部状态
                 hand_state = self.linker_hand.get_current_position()
-                joint_state = self.joint_state_msg(hand_state)
+                joint_state = self.joint_state_msg(hand_state,vel=hand_vel,effort=hand_current)
                 self.hand_state_pub.publish(joint_state)
                 
                 
@@ -134,18 +139,22 @@ class LinkerHand(Node):
         except Exception as e:
             print(f"❌ 发生错误: {e}")
 
-    def joint_state_msg(self, pose,vel=[]):
+    def joint_state_msg(self, pose,vel=[],effort=[]):
         joint_state = JointState()
         joint_state.header = Header()
         # 当前时间戳
         joint_state.header.stamp = self.get_clock().now().to_msg()
         joint_state.name = NAMES_EN
         joint_state.position = [float(x) for x in pose]
+        # 如果速度和力矩数据为空，则填充为0
         if len(vel) > 1:
             joint_state.velocity = [float(x) for x in vel]
         else:
             joint_state.velocity = [0.0] * len(pose)
-        joint_state.effort = [0.0] * len(pose)
+        if len(effort) > 1:
+            joint_state.effort = [float(x) for x in effort]
+        else:
+            joint_state.effort = [0.0] * len(pose)
         return joint_state
     
     def hand_setting_cb(self,msg):

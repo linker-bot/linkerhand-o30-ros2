@@ -517,14 +517,13 @@ class SocketCANCommunication(CANFDCommunication):
 
     用于「透明塑封 USB 转 CANFD 设备」：该设备在 Linux 下走标准 SocketCAN，
     无需厂商私有库(libcanbus.so)，通过内核 can0 接口 + python-can 收发。
-    继承 CANFDCommunication，仅重写底层传输方法；帧格式与厂商设备完全一致
-    （O30 为 11 位标准帧），故上层 Controller 无需任何改动。
+    继承 CANFDCommunication，仅重写底层传输方法；帧格式与厂商设备完全一致。
     """
 
     def __init__(self, channel: str = "can0", bitrate: int = 1000000,
                  dbitrate: int = 5000000, auto_setup: bool = True):
         self.channel = channel      # 接口名，如 "can0"
-        self.bitrate = bitrate      # 仲裁段波特率，默认 1Mbps（与 O30 libcanbus 一致）
+        self.bitrate = bitrate      # 仲裁段波特率，默认 1Mbps
         self.dbitrate = dbitrate    # 数据段波特率，默认 5Mbps
         self.auto_setup = auto_setup
         self.bus = None
@@ -544,8 +543,7 @@ class SocketCANCommunication(CANFDCommunication):
         逐条容错，失败不中断（接口可能已由用户提前配置）。
         """
         cmds = [
-            # (命令, 是否必需)。restart-ms 部分控制器不支持，单独下发且允许失败，
-            # 避免它把 bitrate/dbitrate 这条关键配置一起带崩。
+            # 激活CAN/CANFD设备
             (["sudo", "ip", "link", "set", self.channel, "down"], True),
             (["sudo", "ip", "link", "set", self.channel, "type", "can",
               "bitrate", str(self.bitrate), "dbitrate", str(self.dbitrate),

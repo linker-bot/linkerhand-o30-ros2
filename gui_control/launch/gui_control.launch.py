@@ -41,7 +41,7 @@ def generate_launch_description():
                 'hand_joint': "O30",  # O30 字母为大写
                 'topic_hz': 30, # topic发布频率
                 'is_touch': True, # 是否有压力传感器
-                'is_arc': False, # 是否发布弧度消息
+                'is_rad': False, # 是否发布弧度消息
             }],
         ),
         # Node(
