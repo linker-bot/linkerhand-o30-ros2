@@ -29,8 +29,8 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        # declare_show_diagram,
-        # pressure_diagram_launch,
+        declare_show_diagram,
+        pressure_diagram_launch,
         Node(
             package='gui_control',
             executable='gui_control',
