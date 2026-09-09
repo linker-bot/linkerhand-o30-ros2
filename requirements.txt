@@ -1,16 +1,5 @@
-numpy>=2.2.6
-python-can
-dm_env
-pexpect
-pyquaternion
-pyagxrobots
-pycryptodome
-ipython
-PyYAML
-tqdm
-pyqt5
-pyqtgraph
-uvicorn
-rich
-wcwidth
-tabulate
+# O30 ROS2 SDK Python 依赖（ROS 2 自带的 rclpy / sensor_msgs / std_msgs 不在此列）
+python-can        # socketcan 后端（comm_type=socketcan）；libcanbus 后端不需要
+pyqt5             # gui_control 调试界面
+tabulate          # 终端表格（产品信息、关节故障打印）
+wcwidth           # 中英混排对齐

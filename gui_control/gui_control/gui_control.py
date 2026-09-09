@@ -89,8 +89,8 @@ class ROS2NodeManager(QObject):
         #try:
         self.joint_state.header.stamp = self.node.get_clock().now().to_msg()
         self.joint_state.position = [float(pos) for pos in positions]
-        self.joint_state.velocity = [255.0] * len(positions)
-        self.joint_state.effort = [255.0] * len(positions)
+        self.joint_state.velocity = [0.0] * len(positions)
+        self.joint_state.effort = [0.0] * len(positions)
         # 如果有关节名称，添加到消息中
         #hand_config = HandConfig.from_hand_type(self.hand_joint)
         hand_config = _HAND_CONFIGS[self.hand_joint]
@@ -113,25 +113,29 @@ class ROS2NodeManager(QObject):
             arc_state.header.stamp = self.node.get_clock().now().to_msg()
             arc_state.name = self.joint_state.name
             arc_state.position = rad_positions
-            arc_state.velocity = [255.0] * len(positions)
-            arc_state.effort = [255.0] * len(positions)
+            arc_state.velocity = [0.0] * len(positions)
+            arc_state.effort = [0.0] * len(positions)
             self.publisher_rad.publish(arc_state)
         self.status_updated.emit("info", "关节状态已发布")
         #except Exception as e:
             #self.status_updated.emit("error", f"发布失败: {str(e)}")
 
+    def _joint_len(self) -> int:
+        """本型号的关节数：驱动只接受长度等于关节数（或 1 广播）的 speed/torque。"""
+        cfg = _HAND_CONFIGS.get(self.hand_joint)
+        if cfg is not None and cfg.joint_names:
+            return len(cfg.joint_names)
+        if self.hand_joint.upper() in ("O6", "L6"):
+            return 6
+        if self.hand_joint == "L7":
+            return 7
+        if self.hand_joint == "L10":
+            return 10
+        return 5
+
     def publish_speed(self, val: int):
-        joint_len = 0
-        if (self.hand_joint.upper() == "O6" or self.hand_joint.upper() == "L6"):
-            joint_len = 6
-        elif self.hand_joint == "L7":
-            joint_len = 7
-        elif self.hand_joint == "L10":
-            joint_len = 10
-        else:
-            joint_len = 5
         msg = String()
-        v = [val] * joint_len
+        v = [val] * self._joint_len()
         data = {
             "setting_cmd": "set_speed",
             "params": {"hand_type":self.hand_type,"speed": v},
@@ -141,22 +145,13 @@ class ROS2NodeManager(QObject):
         self.speed_pub.publish(msg)
 
     def publish_torque(self, val: int):
-        joint_len = 0
-        if (self.hand_joint.upper() == "O6" or self.hand_joint.upper() == "L6"):
-            joint_len = 6
-        elif self.hand_joint == "L7":
-            joint_len = 7
-        elif self.hand_joint == "L10":
-            joint_len = 10
-        else:
-            joint_len = 5
         msg = String()
-        v = [val] * joint_len
+        v = [val] * self._joint_len()
         data = {
             "setting_cmd": "set_max_torque_limits",
             "params": {"hand_type":self.hand_type,"torque": v},
         }
-        
+
         msg.data = json.dumps(data)
         print(f"扭矩值：{v}", flush=True)
         self.torque_pub.publish(msg)

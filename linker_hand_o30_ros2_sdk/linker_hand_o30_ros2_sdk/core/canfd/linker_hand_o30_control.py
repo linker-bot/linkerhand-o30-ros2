@@ -1,34 +1,50 @@
 """
 Linker Hand O30 CANFD 控制类
 
-寻址协议：HOP (Hand Object Protocol) v0.0.3
-依据文档：HandProtocol_v1.0.pdf（同目录），与 1_协议帧格式0.0.3.xlsx 对照修订。
+寻址协议：HOP (Hand Object Protocol)
+依据文档：**O30-HOP协议-20260907.xlsx（同目录，协议文档版本 v0.0.4 / 2026.08.07）**
+          —— 本文件的全部 MI/SI/长度/枚举以该表为唯一准绳，与旧 HandProtocol_v1.0.pdf
+          冲突处一律以 xlsx 为准（尤其是传感器 0x31 与产品信息 0x41 的子索引偏移）。
 
 帧格式（CAN 数据域 = 3 字节帧头 + 载荷）：
     byte0  : bit7 = RTS(0=读实时状态值, 1=读设定值), bit6~0 = MI(主索引/功能码)
     byte1  : SI (子索引 / 对象内起始字节偏移)
     byte2  : EDL(有效数据长度；读请求时=期望返回字节数，写请求时=载荷有效字节数)
-    byte3+ : LD (载荷数据，小端、UTF-8)
+    byte3+ : LD (载荷数据，多字节小端 LSB first、字符串 UTF-8)
 
 读写判定：无载荷=读；有载荷且 EDL<=实际载荷=写。
 响应帧（标准帧，与协议文档及实测抓包一致）：
-    - 返回帧 ID = 请求帧 ID | 0x400；
+    - 返回帧 ID = 请求帧 ID | 0x400（请求 ID 最高位置 1）；
     - 数据区与请求同构：**回显 3 字节帧头(MI/SI/EDL)，其后才是有效载荷**。
     例：读 UID 发 ID=0x001 data=41 39 05；
         收 ID=0x401 data=41 39 05 | 4F 33 30 69 00 ("O30")。
-    出错时回 MI=0x4F 错误码帧(SI=错误索引, EDL=01, 载荷[0]=错误码)。
-CAN FD 单帧最大载荷 61 字节；本实现读请求均控制在单帧内，不做分片重组。
-帧 ID：标准帧(11 位)请求=设备帧ID(右手 0x01/左手 0x02)，响应= 请求|0x400。
+    出错时回 MI=0x4F 错误码帧(SI=错误索引, EDL=01, 载荷[0]=错误码位掩码)。
+CAN FD 单帧最大载荷 64 字节 → 单次可读写有效数据 61 字节(MAX_LD)；超长对象按
+SI 偏移分多帧顺序读取（见 _read_plan / 传感器分通道读取）。
+帧 ID：标准帧(11 位)请求=设备帧ID(右手 0x01/左手 0x02)，响应= 请求|0x400；
+      0x7FF 为特殊探测 ID，设备无论自身 ID 均响应（DISCOVERY_STD_ID）。
 指令示例：
 写右手标识：42 49 01 0F
 写左手标识：42 49 01 F0
 修改标准帧ID：35 00 02 02 00  将手标准帧ID改为02(02 00) 本控制器默认右手为01，左手为02
 保存配置到 Flash：35 1E 01 01
 断电重连后起效
-查询有效关节: 0D 00 24 (从子索引0x00读到0x23, 共36字节; 每字节非0=该关节有效,
-              0x0B=存在+可控+反馈; 见 get_valid_joints)
+查询有效关节: 0D 00 24 (MI 0x0D=有效关节；从子索引0x00读到0x23 共36字节，
+              每字节非0=该关节有效; 关节故障是 MI 0x0C，见 JointFault)
 获取所有关节位置：01 00 19 (读子索引0x00~0x18 共25字节物理区, 内含20个有效电机,
               关节类型分组排列, 空洞位无电机; 见 JOINT_MAP)
+传感器（MI 0x31 命令 + 0x32/0x33/0x34 数据）：先选传感器 31 6E 01 0x，再按缓存的
+              数据总长度整段读数据通道。总长度/行列/单位/**数据分布描述**等元信息在
+              initialize() 阶段一次性探测并缓存(见 probe_sensors)，高频读取时不再发
+              元信息帧。
+              数据区排布由「数据分布描述」(0x2B)定义，例：
+                  FnS_U16_1;FtS_U16_1;FdS_U16_1;Rsv_U16_1;Fn_U8_40
+              = 法向力合力 + 切向力合力 + 切向力合力方向 + 保留 + 40 点阵值。
+              **合力值没有独立寄存器，就在数据区开头，与点阵一次读回**；解析见
+              parse_tactile / get_tactile_force / get_tactile_summary。
+              一次读同时要「矩阵 + 合力」用 get_tactile_data / get_all_tactile_data
+              （返回字典 key 全英文，合力 key 即协议标签 FnS/FtS/FdS）。
+              该规则与 O6 一致，可对照同目录 O6_HOP协议帧格式0.0.4.xlsx「传感器」表。
 """
 
 import os
@@ -42,15 +58,22 @@ from enum import Enum
 
 STATUS_OK = 0
 
+# libcanbus 接收线程空闲时的轮询间隔（秒）。见 CANFDCommunication._receive_loop：
+# 同步请求的应答延迟上限就是这个值，高频触觉读取对它敏感，不要往回调大。
+RX_IDLE_POLL_SLEEP = 0.0002
+
 # ============================================================================
-# 有效电机表（HOP 关节映射，MI=0x00/0x01/0x0C/0x0D 共用此子索引空间）
+# 有效电机表（HOP 关节映射，MI=0x00~0x0F 共用此单字节子索引空间）
 # ----------------------------------------------------------------------------
-# 本表只列 O30 实际存在的 20 个有效电机；不存在的电机一律不收录——以本表为准。
-# 物理子索引 si 仍按「关节类型分组」排布：每种类型在硬件内存里占 5 个连续子索引，
-# 类型顺序 横滚(roll)→航向(yaw)→指根1(root1)→指根2(root2)→指尖(tip)，组内手指
-# 顺序固定 拇指→食指→中指→无名指→小指：
+# 本表只列 O30 实际存在的 20 个有效电机；不存在的电机一律不收录——以本表为准，
+# 与 xlsx「基本信息」的有效关节勾选表一致（横滚仅大拇指、指根2 无大拇指）。
+# 物理子索引 si 按 xlsx「单字节数据子索引与关节对应顺序」——「关节类型分组」排布：
+# 每种类型占 5 个连续子索引，类型顺序 横滚(roll)→航向(yaw)→指根1(root1)→
+# 指根2(root2)→指尖(tip)，组内手指顺序固定 拇指→食指→中指→无名指→小指：
 #   0x00~0x04 横滚   0x05~0x09 航向   0x0A~0x0E 指根1
 #   0x0F~0x13 指根2  0x14~0x18 指尖
+#   0x19~0x1B 手腕(roll/yaw/pitch, 本机无)  0x1C~0x1E 手掌(本机无)
+#   0x1F~0x23 备用关节一~五(本机无)
 # O30 只装了其中 20 个电机，故收录的 si 不连续(有空洞)：横滚仅拇指(0x00)，指根2
 # 无拇指(缺 0x0F)，其余各类齐全。整组偏移写入仍按 JOINT_TYPE_GROUPS 覆盖完整 5 槽
 # (空洞槽硬件忽略)，按指多帧见 JOINT_FINGER_SI。物理收发区间仍是 0x00~0x18
@@ -91,23 +114,24 @@ class RTS:
 
 
 class MI:
-    """主索引 / 功能码 (byte0 bit6~0)，取值 0x00~0x7F"""
-    JOINT_MAP      = 0x00   # 关节逻辑映射表（对象 38 字节）
+    """主索引 / 功能码 (byte0 bit6~0)，取值 0x00~0x7F —— 见 xlsx「协议格式」表"""
+    JOINT_MAP      = 0x00   # 关节映射表（36 个映射索引 + 映射长度0x24 + 启用标志0x25）
     POSITION       = 0x01   # 位置          (单字节向量, 36 字节, 0~255)
-    VELOCITY       = 0x02   # 速度          (单字节向量)
-    ACCEL          = 0x03   # 加速度        (单字节向量)
-    CURRENT        = 0x04   # 电流          (单字节向量)
-    VOLTAGE        = 0x05   # 电压          (单字节向量)
-    TORQUE         = 0x06   # 转矩          (单字节向量)
-    TEMPERATURE    = 0x07   # 温度          (单字节向量)
+    VELOCITY       = 0x02   # 速度限制/目标速度   (单字节向量)
+    ACCEL          = 0x03   # 加速度限制         (单字节向量)
+    CURRENT        = 0x04   # 电流限制/目标电流   (单字节向量)
+    VOLTAGE        = 0x05   # 电压限制/目标电压   (单字节向量)
+    TORQUE         = 0x06   # 转矩限制/目标转矩   (单字节向量)
+    TEMPERATURE    = 0x07   # 温度限制           (单字节向量)
     MOVE_TIME      = 0x08   # 运动时间      (单字节向量, 单位 10ms/格)
     STALL_TIME     = 0x09   # 堵转判定时间
     STALL_THRESH   = 0x0A   # 堵转判定阈值
     STALL_CURRENT  = 0x0B   # 堵转后维持电流
-    JOINT_ENABLE   = 0x0C   # 有效关节(可写使能) (单字节向量, 每关节 1 字节位掩码)
-    JOINT_FAULT    = 0x0D   # 关节状态/能力位掩码(只读) —— 实测读 0D 00 24 返回每关节存在/
-                            #   能力位(非0=有效, 0x0B=存在+可控+反馈, 见 JointBit)；
-                            #   用于上电探测有效关节(get_valid_joints)。(spec 名"关节故障")
+    JOINT_FAULT    = 0x0C   # 关节故障(只读位掩码, 每关节 1 字节, 见 JointFault)
+    JOINT_ENABLE   = 0x0D   # 有效关节(可读写, 每关节 1 字节能力/使能位掩码, 见 JointBit)
+                            #   上电探测有效关节即读此项：0D 00 24
+    INC_POSITION   = 0x0E   # 增量型位置控制——增（单字节向量, 各关节目标位置 +=）
+    DEC_POSITION   = 0x0F   # 增量型位置控制——减（单字节向量, 各关节目标位置 -=）
     HALF_POSITION  = 0x20   # 位置（半字）  (半字向量, 72 字节, 0~65535)
     POS_PID_P      = 0x21
     POS_PID_I      = 0x22
@@ -115,20 +139,22 @@ class MI:
     VEL_PID_P      = 0x24
     VEL_PID_I      = 0x25
     VEL_PID_D      = 0x26
-    SPARSE_POS     = 0x30   # 稀疏关节位置（关节号+位置值 成对）
-    SENSOR_CMD     = 0x31   # 传感器命令（对象 50 字节）
-    SENSOR_DATA1   = 0x32   # 传感器数据通道1（第 0~254 字节，只读）
-    SENSOR_DATA2   = 0x33   # 传感器数据通道2（第 255~510 字节）
-    SENSOR_DATA3   = 0x34   # 传感器数据通道3（第 511 字节起）
-    CONFIG         = 0x35   # 配置（结构体 31 字节）
+    SPARSE_POS     = 0x30   # 稀疏关节位置（关节号+位置值 成对，本机支持前 19 组）
+    SENSOR_CMD     = 0x31   # 传感器命令/元信息（对象 115 字节，见 SensorSI）
+    SENSOR_DATA1   = 0x32   # 传感器数据通道1（数据第 0~254 字节，只读）
+    SENSOR_DATA2   = 0x33   # 传感器数据通道2（数据第 255~509 字节，只读）
+    SENSOR_DATA3   = 0x34   # 传感器数据通道3（数据第 510~764 字节，只读）
+    CONFIG         = 0x35   # 配置（结构体 32 字节，见 ConfigSI）
     ACTION_1       = 0x36   # 预设动作 1（0x36~0x3A 为动作 1~5，各 7 字节）
-    PRODUCT_INFO   = 0x41   # 产品信息（结构体 241 字节，只读）
-    ENGINEERING    = 0x42   # 工程服务（结构体 222 字节）
-    UNIT_RANGE     = 0x43   # 单位与量程（结构体 162 字节）
-    ERROR_CODE     = 0x4F   # 通信错误码（结构体 17 字节，只读）
+    PRODUCT_INFO   = 0x41   # 产品信息（结构体 249 字节，只读，见 ProductInfoSI）
+    ENGINEERING    = 0x42   # 调试功能A / 工程服务（见 EngineeringSI）
+    UNIT_RANGE     = 0x43   # 控制量单位及物理数值范围查询（先写 SI0x00 指定所查 MI）
+    DEBUG_B        = 0x44   # 调试功能B（各关节行程起点位置偏置 int8 向量）
+    MOTOR_STATS    = 0x45   # 关节电机状态统计（先写 SI0x00 指定所查状态类型）
+    ERROR_CODE     = 0x4F   # 通信错误码（SI0x00=最新错误索引 + 15 条历史，只读）
 
 
-# MI 0x0C 有效关节 —— 每关节 1 字节位掩码
+# MI 0x0D 有效关节 —— 每关节 1 字节位掩码（协议表未逐位列出，取实测含义）
 class JointBit:
     PRESENT      = 0x01   # bit0 关节存在
     CONTROLLABLE = 0x02   # bit1 允许控制
@@ -138,95 +164,234 @@ class JointBit:
     ENABLE_DEFAULT = 0x0F  # 存在+可控+已使能+反馈（文档典型上电使能值）
 
 
+class JointFault:
+    """MI 0x0C 关节故障 —— 每关节 1 字节位掩码（xlsx「关节故障码附表」）"""
+    HAND_STALL     = 0x01   # bit0 灵巧手层判定执行器堵转（较易触发，条件可调）
+    MOTOR_STALL    = 0x02   # bit1 执行器层判定堵转（较难触发，多数情况可调）
+    OVER_CURRENT   = 0x04   # bit2 执行器过流
+    OVER_TEMP      = 0x08   # bit3 执行器过温
+    MOTOR_ABNORMAL = 0x40   # bit6 执行器异常（电机/编码器/驱动器等不可恢复故障）
+    MOTOR_OFFLINE  = 0x80   # bit7 执行器离线（无法与执行器建立通信）
+
+
+# 故障位 → 名称，供 decode_joint_fault 逐位翻译
+JOINT_FAULT_NAMES = {
+    JointFault.HAND_STALL:     "灵巧手层判定堵转",
+    JointFault.MOTOR_STALL:    "执行器层判定堵转",
+    JointFault.OVER_CURRENT:   "执行器过流",
+    JointFault.OVER_TEMP:      "执行器过温",
+    JointFault.MOTOR_ABNORMAL: "执行器异常",
+    JointFault.MOTOR_OFFLINE:  "执行器离线",
+}
+
+
 class ProductInfoSI:
     """产品信息子索引 (MI=0x41)，全部 str / 只读 —— (SI, 字节长度)
 
-    ⚠️ 实测本机固件为 HOP 0.0.2：设备唯一标识码 = 32 字节（非 PDF 0.0.3 的 48），
-       因此自「协议名称」起的字段相对 PDF 整体左移 0x10。若换 0.0.3 固件，
-       需把 DEVICE_UID 改回 48 并将 0x59 及之后字段各 +0x10（用 dump_product_info 核对）。
+    偏移完全按 xlsx「产品信息子索引」表(v0.0.4)：设备唯一标识码 32 字节，
+    三块硬件版本各 16 字节（旧 0.0.2 固件为 8 字节，故 0x99 之后整体右移）。
+    换固件若发现字段错位，用 dump_product_info() 打印原始区再校准。
     """
     MODEL              = (0x00, 16)   # 产品型号全名 例:O30
-    VOLTAGE_RANGE      = (0x10, 16)   # 供电电压范围  例:12V~24V
+    VOLTAGE_RANGE      = (0x10, 16)   # 产品供电电压范围  例:12V~24V
     MCU_UID            = (0x20, 25)   # MCU 唯一标识码
-    DEVICE_UID         = (0x39, 32)   # 设备唯一标识码（0.0.2 为 32 字节）
+    DEVICE_UID         = (0x39, 32)   # 设备唯一标识码 例:LHT20XXXXXXXXXXXX
     PROTOCOL_NAME      = (0x59, 8)    # 协议名称 例:HOP
-    PROTOCOL_VERSION   = (0x61, 8)    # 协议版本 例:0.0.2
-    HW_VER_INTERFACE   = (0x69, 8)    # 接口板硬件版本 例:V1.2.0
-    HW_VER_ADAPTER     = (0x71, 8)    # 转接板硬件版本 例:V1.1.0
-    HW_VER_CONTROL     = (0x79, 8)    # 控制板硬件版本
-    BOOTLOADER_VERSION = (0x81, 8)    # bootloader 软件版本
-    APP_VERSION        = (0x89, 8)    # app 程序版本
-    MECH_VERSION       = (0x91, 8)    # 机械结构版本
-    BUILD_TIME         = (0x99, 32)   # 程序编译时间 例:2026-05-xx xx:xx:50
-    SUPPORTED_PROTO    = (0xB9, 32)   # 支持协议/接口类型 例:CAN,UART
-    HAND_SIDE          = (0xD9, 8)    # 左右手标识 LEFT/RIGHT
+    PROTOCOL_VERSION   = (0x61, 8)    # 协议版本 例:1.0.0
+    HW_VER_INTERFACE   = (0x69, 16)   # 接口板硬件名称及版本 例:241024/V1.2.0
+    HW_VER_ADAPTER     = (0x79, 16)   # 转接板硬件名称及版本 例:241024/V1.1.0
+    HW_VER_CONTROL     = (0x89, 16)   # 控制板硬件名称及版本 例:241024/V0.9.0
+    BOOTLOADER_VERSION = (0x99, 8)    # bootloader 软件版本
+    APP_VERSION        = (0xA1, 8)    # app 程序版本 例:1.0.3
+    MECH_VERSION       = (0xA9, 8)    # 机械结构版本
+    BUILD_TIME         = (0xB1, 32)   # 程序编译时间 例:2025-12-26 18:41:22
+    SUPPORTED_PROTO    = (0xD1, 32)   # 支持协议/接口类型 例:CAN
+    HAND_SIDE          = (0xF1, 8)    # 左右手标识 LEFT/RIGHT
 
 
 class ConfigSI:
-    """配置指令子索引 (MI=0x35)"""
-    STD_FRAME_ID   = 0x00   # uint16  标准帧 id (0x0001~0x03FE)
-    EXT_FRAME_ID   = 0x02   # uint32  扩展帧 id
-    CAN_TYPE       = 0x06   # uint8   0x01=CAN2.0, 0x02=CAN FD
-    BRS_ENABLE     = 0x07   # uint8   仅 CAN FD; 0x01=启用波特率切换
-    ARB_BAUD       = 0x08   # uint8   仲裁域波特率
-    DATA_BAUD      = 0x09   # uint8   数据域波特率(CAN FD)
-    SILENT         = 0x0A   # uint8   0x01=不发送响应帧
-    CTRL_MODE      = 0x18   # uint8   控制模式
-    LED_ENABLE     = 0x19   # uint8   指示灯开关
-    BUZZER_ENABLE  = 0x1B   # uint8   蜂鸣器开关
-    RESTORE_CONFIG = 0x1C   # uint8   写 0x01 恢复映射+配置为默认并立即写 Flash
-    RESTORE_ALL    = 0x1D   # uint8   写 0x01 恢复所有数据(须先写工程服务密码)
-    SAVE_TO_FLASH  = 0x1E   # uint8   写 0x01 保存 RAM 待保存区到 Flash
+    """配置指令子索引 (MI=0x35)。⚠️ 标 [不支持] 者本机固件未实现（xlsx 该列为「否」）"""
+    STD_FRAME_ID     = 0x00   # uint16  标准帧 id (0x000~0x3FE)
+    EXT_FRAME_ID     = 0x02   # uint32  扩展帧 id (0~0xFFFFFFE)
+    CAN_TYPE         = 0x06   # uint8   1=CAN2.0, 2=FDCAN
+    BRS_ENABLE       = 0x07   # uint8   1=启用波特率切换（默认 0）
+    ARB_BAUD         = 0x08   # uint8   仲裁域波特率 1=1000k 2=800k 3=500k … 8=100k
+    DATA_BAUD        = 0x09   # uint8   数据域波特率 1=8000k 2=5000k(默认) … 13=100k
+    SILENT           = 0x0A   # uint8   1=屏蔽返回帧
+    MODBUS_ADDR      = 0x0B   # uint8   [不支持] modbus 从机地址 1~247
+    MODBUS_BAUD      = 0x0C   # uint8   [不支持] modbus 串口波特率枚举
+    MODBUS_MODE      = 0x0D   # uint8   [不支持] 1=rtu, 2=ascii
+    MODBUS_PARITY    = 0x0E   # uint8   [不支持] 1=none 2=even 3=odd
+    MODBUS_STOP_BITS = 0x0F   # uint8   [不支持] 1=1 2=1.5 3=2
+    ECAT_ALIAS       = 0x10   # uint16  [不支持] EtherCAT 别名地址
+    ECAT_POSITION    = 0x12   # uint16  [不支持] EtherCAT 物理位置
+    ECAT_DC_ENABLE   = 0x14   # uint8   [不支持] 启用 DC 分布式时钟
+    ECAT_WD_ENABLE   = 0x15   # uint8   [不支持] 启用 EtherCAT watchdog
+    ECAT_WD_TIMEOUT  = 0x16   # uint16  [不支持] watchdog 超时时间
+    CTRL_MODE        = 0x18   # uint8   [不支持] 控制模式，见 CtrlMode（默认 1 位置模式）
+    LED_ENABLE       = 0x19   # uint8   [不支持] 指示灯开关（默认 1）
+    LED_FAULT_ONLY   = 0x1A   # uint8   [不支持] 指示灯只指示故障
+    BUZZER_ENABLE    = 0x1B   # uint8   [不支持] 蜂鸣器开关（默认 0）
+    RESTORE_CONFIG   = 0x1C   # uint8   写 1 恢复配置数据为默认值
+    RESTORE_ALL      = 0x1D   # uint8   写 1 恢复所有数据（须先写工程服务密码）
+    SAVE_TO_FLASH    = 0x1E   # uint8   写 1 保存参数到 Flash
+    SAVE_MOTOR_PARAM = 0x1F   # uint8   [不支持] 保存电机参数到电机非易失存储
 
 
 class EngineeringSI:
-    """工程服务子索引 (MI=0x42)"""
-    PASSWORD        = 0x00   # str8   写入配置密码(默认 123456)
-    HEARTBEAT       = 0x45   # uint32 连接指示心跳(只读, 设备周期自增)
-    HAND_SIDE       = 0x49   # uint8  0xF0=左手, 0x0F=右手
-    SENSOR_TYPE     = 0x4A   # uint8  传感器类型枚举
-    DEVICE_UID      = 0xAB   # str48  设备唯一标识码
-    UPDATE_APP      = 0xDB   # uint8  写 0x01 跳转 Bootloader
-    PROTOCOL_SWITCH = 0xDD   # uint8  0x00=HOP, 0x01=旧版CAN协议(须保存重启)
+    """调试功能A / 工程服务子索引 (MI=0x42)。标 [不支持] 者本机固件未实现"""
+    PASSWORD        = 0x00   # str8       写入配置密码(6 位, 默认 123456)
+    AUTO_ZERO       = 0x08   # uint8[5]   [不支持] 按位开启对应关节自动找零点
+    CLEAR_MAX_LIMIT = 0x0D   # uint8      [不支持] 写 1 清除/放宽最大限位
+    SET_MAX_LIMIT   = 0x0E   # uint8[5]   [不支持] 按位设当前位置为最大限位
+    CLEAR_MIN_LIMIT = 0x13   # uint8      [不支持] 写 1 清除/放宽最小限位
+    SET_MIN_LIMIT   = 0x14   # uint8[5]   [不支持] 按位设当前位置为最小限位
+    SET_MID_POINT   = 0x19   # uint8[5]   [不支持] 按位设当前位置为行程中点
+    CALIBRATED      = 0x1E   # uint8[5]   按位表示相应关节是否已校准
+    CALIB_COUNT     = 0x23   # uint16     [不支持] 校准次数
+    CALIB_DATE      = 0x25   # str24      [不支持] 校准日期 YYYY-MM-DD hh:mm:ss
+    IF_FAULT_FLAGS  = 0x3D   # uint8[8]   [不支持] 所有通信接口故障标志
+    HEARTBEAT       = 0x45   # uint32     [不支持] 连接指示心跳(下位机每秒 +1)
+    HAND_SIDE       = 0x49   # uint8      0xF0=左手, 0x0F=右手（出厂设定）
+    SENSOR_TYPE     = 0x4A   # enum uint8 [不支持] 传感器类型，见 SENSOR_TYPE_ENUM
+    POWER_ON_TIME   = 0x4B   # str16      [不支持] 本次上电运行时间 "00:00:22:25"
+    TOTAL_RUN_TIME  = 0x5B   # str16      [不支持] 总运行时间
+    MOTOR_RUN_TIME  = 0x6B   # str16      [不支持] 电机运行时长
+    TASK_FREQ       = 0x7B   # uint16[24] [不支持] 任务执行频率(48 字节)
+    DEVICE_UID      = 0xAB   # str32      设备唯一标识码
+    UPDATE_APP      = 0xCB   # uint8      写 1 跳转 Bootloader 更新 app
+    UPDATE_MOTOR_FW = 0xCC   # uint8      [不支持] 写 1 切换到更新电机固件模式
+    PROTOCOL_SWITCH = 0xCD   # uint8      接口协议切换（新旧协议过渡期用）
 
 
 class CtrlMode:
-    """控制模式 (ConfigSI.CTRL_MODE 取值)，默认 0x01"""
+    """控制模式 (ConfigSI.CTRL_MODE 取值)，默认 0x01。
+    ⚠️ xlsx 标注控制模式子索引本机固件「不支持该功能」，写入可能被忽略。"""
     POSITION      = 0x01   # 位置模式
     VELOCITY      = 0x02   # 速度模式
     CURRENT       = 0x03   # 电流模式
     TORQUE        = 0x04   # 转矩模式
-    POSITION_TIME = 0x05   # 位置时间模式
-    OPEN_LOOP     = 0x06   # 开环模式
-    COMPLIANT     = 0x07   # 柔顺控制
-    TEACH         = 0x08   # 教学习模式
-    DRAG          = 0x09   # 拖动模式
+    OPEN_LOOP     = 0x05   # 开环模式
+    COMPLIANT     = 0x06   # 柔顺控制模式
+    TEACH         = 0x07   # 教学习模式
+    DRAG          = 0x08   # 拖动模式
 
 
 class ErrorCode:
-    """通信错误码 (MI=0x4F)，位掩码可组合"""
+    """通信错误码 (MI=0x4F)，按位错误标志可组合（xlsx「通信协议错误码」）"""
     OK              = 0x00
-    MI_NOT_EXIST    = 0x01   # 主索引不存在
-    SI_NOT_EXIST    = 0x02   # 子索引不存在
-    NOT_WRITABLE    = 0x04   # 寄存器不可写
-    LEN_MISMATCH    = 0x08   # 数据长度不匹配
-    NO_PERMISSION   = 0x10   # 权限不足
-    DATA_PADDED     = 0x20   # 返回数据有补零
-    VALUE_INVALID   = 0x40   # 数据值非法
+    MI_NOT_EXIST    = 0x01   # bit0 主索引不存在
+    SI_NOT_EXIST    = 0x02   # bit1 子索引不存在
+    NOT_WRITABLE    = 0x04   # bit2 寄存器不可写
+    LEN_MISMATCH    = 0x08   # bit3 数据长度不匹配
+    NO_PERMISSION   = 0x10   # bit4 权限不足（未输入密码）
+    DATA_PADDED     = 0x20   # bit5 返回数据存在补零
+
+
+ERROR_CODE_NAMES = {
+    ErrorCode.MI_NOT_EXIST:  "主索引不存在",
+    ErrorCode.SI_NOT_EXIST:  "子索引不存在",
+    ErrorCode.NOT_WRITABLE:  "寄存器不可写",
+    ErrorCode.LEN_MISMATCH:  "数据长度不匹配",
+    ErrorCode.NO_PERMISSION: "权限不足(未输入密码)",
+    ErrorCode.DATA_PADDED:   "返回数据存在补零",
+}
+ERROR_LATEST_INDEX_SI = 0x00   # MI 0x4F SI0x00：最新一次错误索引 (1~15)
+ERROR_HISTORY_COUNT   = 15     # SI 0x01~0x0F：15 条历史错误码
 
 
 class SensorFinger:
-    """选择传感器 (MI 0x31 SI 0x2D)"""
+    """选择传感器取值 (MI 0x31 SI 0x6E) —— 手指编号 1~5，手掌 6"""
     THUMB  = 1   # 大拇指
     INDEX  = 2   # 食指
     MIDDLE = 3   # 中指
     RING   = 4   # 无名指
     PINKY  = 5   # 小拇指
-    PALM   = 6   # 手掌
+    PALM   = 6   # 手掌（本机通常未装，probe_sensors 会自动跳过）
+
+
+SENSOR_FINGER_NAMES = {
+    SensorFinger.THUMB:  "thumb",
+    SensorFinger.INDEX:  "index",
+    SensorFinger.MIDDLE: "middle",
+    SensorFinger.RING:   "ring",
+    SensorFinger.PINKY:  "pinky",
+    SensorFinger.PALM:   "palm",
+}
+# probe_sensors 默认探测的传感器编号（按协议“选择传感器”取值域顺序）
+SENSOR_PROBE_ORDER = (SensorFinger.THUMB, SensorFinger.INDEX, SensorFinger.MIDDLE,
+                      SensorFinger.RING, SensorFinger.PINKY, SensorFinger.PALM)
+
+
+class SensorSI:
+    """传感器命令/元信息子索引 (MI=0x31) —— 严格按 xlsx「传感器」表 v0.0.4。
+    ⚠️ 与旧固件(0.0.2)相比 数据总长度 0x2B→0x6C、选择传感器 0x2D→0x6E。
+
+    ⚠️ 数据分布描述在 **0x2B**：该子索引读回的直接就是描述字符串本身
+       （ASCII，形如 ``FnS_U16_1;FtS_U16_1;FdS_U16_1;Rsv_U16_1;Fn_U8_40``），
+       描述 0x00 数据区的排布——合力值就在数据区开头，没有独立寄存器。
+       xlsx 表格行把 0x2B 记为「描述长度」、0x2C 记为「描述内容」，与实测不符；
+       为兼容这类固件保留 DIST_DESC_ALT(0x2C)，仅当 0x2B 读回不像描述时才用。
+    """
+    TYPE          = (0x00, 32)   # str32 传感器类型   ro
+    UNIT          = (0x20, 8)    # str8  数据单位     ro
+    RANGE         = 0x28         # uint8 传感器量程 0~255            ro
+    MAX_ROWS      = 0x29         # uint8 数据最大行(点阵类有效)      ro
+    MAX_COLS      = 0x2A         # uint8 数据最大列(点阵类有效)      ro
+    DIST_DESC     = (0x2B, 64)   # str   数据分布描述(ASCII)         ro
+    DIST_DESC_ALT = (0x2C, 64)   # str64 数据分布描述(旧表述: 0x2B 为长度) ro
+    TOTAL_LENGTH  = (0x6C, 2)    # uint16 数据总长度（小端）         ro
+    SELECT        = 0x6E         # uint8 选择传感器（见 SensorFinger）rw
+    DATA_ROWS     = 0x6F         # uint8 数据行                      rw
+    DATA_COLS     = 0x70         # uint8 数据列                      rw
+    FLAG_MODE     = 0x71         # uint8 切换到传感器有效数据标识模式(0/1, 默认0) rw
+                                 #   置 1 时数据区固定为 有效=1/无效=0，用于确认
+                                 #   异形传感器补零后的位置关系
+    PAD_RECT      = 0x72         # uint8 是否填充无效数据把外轮廓补成矩形(0/1, 默认1) rw
+                                 #   置 0 时数据区是一维有效数据，需自行按分布描述还原
+
+
+# 传感器数据通道：0x32/0x33/0x34 各覆盖 255 字节（SI 0x00~0xFE）
+SENSOR_CHANNEL_MIS  = (MI.SENSOR_DATA1, MI.SENSOR_DATA2, MI.SENSOR_DATA3)
+SENSOR_CHANNEL_SPAN = 255
+MAX_LD = 61            # CAN FD 单帧有效载荷上限 = 64 - 3 字节帧头
+
+
+# ---------------------------------------------------------------------------
+# 数据分布描述（MI 0x31 SI 0x2B，读回即 ASCII 描述串本身）
+# ---------------------------------------------------------------------------
+# 传感器数据区（0x32/0x33/0x34）不是纯点阵！其排布由「数据分布描述」字符串定义，
+# 字段以 ';' 分隔，每段格式 <标签>_<类型>_<个数>，按先后顺序连续存放。
+# O6 协议原文示例（O6 与 O30 传感器规则完全一致，见 O6_HOP协议帧格式0.0.4.xlsx
+# 「传感器」表 r30）：
+#     FnS_U16_1;FtS_U16_1;FdS_U16_1;Rsv_U16_1;Fn_U8_40
+#   = 1×uint16 法向力合力 + 1×uint16 切向力合力 + 1×uint16 切向力合力方向
+#     + 1×uint16 保留 + 40×uint8 点阵值        （合计 8 字节头 + 40 字节点阵）
+# 即 **合力值就在数据区开头**，与点阵一次读回，无需额外指令。
+# ---------------------------------------------------------------------------
+SENSOR_FIELD_TYPE_SIZE = {
+    "U8": 1, "I8": 1, "S8": 1,
+    "U16": 2, "I16": 2, "S16": 2,
+    "U32": 4, "I32": 4, "S32": 4, "F32": 4,
+}
+SENSOR_FIELD_SIGNED = ("I8", "S8", "I16", "S16", "I32", "S32")
+SENSOR_FIELD_NAMES = {
+    "FnS": "法向力合力",
+    "FtS": "切向力合力",
+    "FdS": "切向力合力方向",
+    "Fn":  "法向力点阵",
+    "Ft":  "切向力点阵",
+    "Fd":  "方向点阵",
+    "Rsv": "保留",
+}
+# 合力类标量字段（个数为 1，位于数据区头部）
+SENSOR_FORCE_TAGS = ("FnS", "FtS", "FdS")
+# 点阵类字段标签（个数 = 行×列）
+SENSOR_MATRIX_TAGS = ("Fn", "Ft", "Fd")
 
 
 class SensorType:
-    """传感器类型字符串枚举 (MI 0x31 SI 0x00)"""
+    """传感器类型字符串枚举 (MI 0x31 SI 0x00 返回的 str32)"""
     NO_SENSOR     = "NO_SENSOR"
     TASHAN_GATHER = "TASHAN_GATHER"   # 他山(外部采集板)
     HUAWEIKE      = "HUAWEIKE"        # 华威科
@@ -235,32 +400,50 @@ class SensorType:
     TSSP_JZG      = "TSSP_JZG"        # TSSP 晶致感
 
 
-# 工程服务 0x42/0x4A 传感器类型 uint8 枚举 → 名称（见 HandProtocol 传感器类型表）
+# 工程服务 0x42/0x4A 传感器设置 uint8 枚举 → 名称（xlsx「调试功能A」0x4A）
 SENSOR_TYPE_ENUM = {
     0x00: "无传感器",
-    0x01: "TS(采集板)",
-    0x02: "HWK",
-    0x03: "FL",
-    0x04: "TSSP_GENGLE",
-    0x05: "TSSP_JZG",
+    0x01: "TS传感器(采集板)",
+    0x02: "HWK传感器",
+    0x03: "FL传感器",
+    0x04: "TSSP_GENGLE传感器",
+    0x05: "TSSP_JZG传感器",
 }
 
 
 class Gesture:
-    """预设手势类型 (MI 0x36~0x3A SI 0x00)"""
-    NONE         = 0x00
-    NUMBER_1     = 0x01   # 0x01~0x0A 为数字 1~10
+    """预设手势/动作类型 (MI 0x36~0x3A SI 0x00)。
+    ⚠️ xlsx「预设动作及动作编排」全部子索引标注本机固件「不支持该功能」，
+       写入通常无动作，仅保留接口备用。"""
+    NONE         = 0x00   # 无效手势，无动作执行
+    NUMBER_1     = 0x01   # 0x01~0x0A 为数字手势 1~10
     NUMBER_10    = 0x0A
     HALF_GRIP    = 0x0B   # 半握
-    CIRCLE       = 0x0C   # 画圆
-    ELLIPSE      = 0x0D   # 画椭圆
+    CIRCLE       = 0x0C   # 手指画圆
+    ELLIPSE      = 0x0D   # 手指画椭圆
     FINGER_DANCE = 0x0E   # 手指舞
-    ROCK         = 0x0F   # 石头
-    SCISSORS     = 0x10   # 剪刀
-    PAPER        = 0x11   # 布
+    ROCK         = 0x0F   # 猜拳-石头
+    SCISSORS     = 0x10   # 猜拳-剪刀
+    PAPER        = 0x11   # 猜拳-布
     GRASP        = 0x12   # 抓握
     EXTEND       = 0x13   # 伸展
-    PACK         = 0x14   # 打包
+    PACK         = 0x14   # 打包手势
+
+
+class ActionSI:
+    """预设动作子索引 (MI 0x36~0x3A，各 7 字节)"""
+    TYPE       = 0x00   # uint8 动作类型（见 Gesture）
+    SPEED      = 0x01   # uint8 动作执行速度 0~255
+    AMPLITUDE  = 0x02   # uint8 动作幅值 0~255
+    LOOPS      = 0x03   # uint8 动作循环次数 0~255
+    FINGER     = 0x04   # uint8 手指指定 1~5
+    RUN_FLAG   = 0x05   # uint8 动作执行标志 0=执行完毕 1=正在执行
+    POWERUP_EN = 0x06   # uint8 是否上电默认执行 0/1
+
+
+# 稀疏关节位置控制 (MI 0x30)：每组 2 字节(关节序号 + 目标位置)，
+# xlsx 标注本机固件仅前 19 组「支持该功能」，第 20~36 组为否。
+SPARSE_MAX_PAIRS = 19
 
 
 # 有效关节的“逻辑顺序”—— O30 共 20 个有效电机（不存在的电机不收录，见 JOINT_MAP）。
@@ -479,9 +662,15 @@ class CANFDCommunication:
                         payload = bytes(msg.Data[:data_len])
                         if self.on_frame is not None:
                             self.on_frame(msg.ID, payload)
+                    continue      # 有帧就立刻再取，不睡——连续分段读时省掉整段延迟
             except Exception:
                 pass
-            time.sleep(0.002)
+            # 空闲让出 CPU。⚠️ 这个值直接决定同步请求的应答延迟：应答若落在睡眠
+            # 期间，_request 就要多等这么久。原为 2ms，高频触觉(五指 30Hz 需要
+            # 13 个带应答事务/周期)时平均每次读凭空多 1ms，是当时的主要瓶颈。
+            # 降到 0.2ms：最坏额外延迟 0.2ms，代价是空闲时每秒多几千次
+            # CANFD_Receive 调用（该调用自带 10ms 等待，实测 CPU 占用可忽略）。
+            time.sleep(RX_IDLE_POLL_SLEEP)
 
     def send_frame(self, can_id: int, data: bytes = b'') -> bool:
         """发送一个 CANFD 标准帧(11 位 ID)"""
@@ -699,17 +888,19 @@ class SocketCANCommunication(CANFDCommunication):
 # 控制类
 # ============================================================================
 class LinkerHandO30Controller:
-    """Linker Hand O30 灵巧手 CANFD 控制类（HOP v0.0.3 协议）"""
+    """Linker Hand O30 灵巧手 CANFD 控制类
+    （HOP 协议，依据 O30-HOP协议-20260907.xlsx / 文档版本 v0.0.4）"""
 
     DLC2LEN = [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64]
 
     def __init__(self, hand_type: str = "right", canfd_device: int = 0,
                  frame_id: Optional[int] = None, comm_type: str = "libcanbus",
                  channel: str = "can0", bitrate: int = 1000000,
-                 dbitrate: int = 5000000, auto_setup: bool = True):
+                 dbitrate: int = 5000000, auto_setup: bool = True,
+                 probe_sensor: bool = True):
         """
         hand_type   : "left"/"right"，仅作标签；HOP 协议左右手实际靠帧 ID 或读
-                      产品信息(0x41/0xE9)区分，不内嵌于 CAN ID。
+                      产品信息(0x41/0xF1)/工程服务(0x42/0x49)区分，不内嵌于 CAN ID。
         frame_id    : 设备标准帧 ID(11 位)。不指定时按惯例 右手=0x01 / 左手=0x02
                       （同总线双手需各自配置不同 ID）。
         comm_type   : 通信后端 —— "libcanbus"(默认, 厂商私有库) 或
@@ -717,6 +908,10 @@ class LinkerHandO30Controller:
         canfd_device: 仅 libcanbus 用——设备序号。
         channel     : libcanbus 下为通道号(默认 0)；socketcan 下为接口名(默认 "can0")。
         bitrate/dbitrate/auto_setup : 仅 socketcan 用——仲裁/数据段波特率与是否自动拉起接口。
+        probe_sensor: True(默认) 时在 initialize() 里一次性探测并缓存各传感器的
+                      数据总长度/行列/单位/量程及分段读取计划(见 probe_sensors)；
+                      之后高频读取只需「选择传感器 + 按缓存长度读数据通道」，
+                      不再重复发元信息帧。
         """
         self.hand_type = hand_type
         if frame_id is None:
@@ -725,6 +920,7 @@ class LinkerHandO30Controller:
         self.device_id = frame_id
         self.canfd_device = canfd_device
         self.comm_type = comm_type
+        self._probe_sensor = probe_sensor
 
         # 请求帧 / 返回帧的 CAN ID（标准帧）
         self._tx_id = self.device_id
@@ -745,6 +941,23 @@ class LinkerHandO30Controller:
         self.product_info: Dict[str, str] = {}
         self.last_error_code: int = ErrorCode.OK
 
+        # ---- 传感器缓存（高频读取的核心：元信息只在初始化时读一次） ----
+        # sensors[finger] = {name, type, unit, range, rows, cols, total_length,
+        #                    dist_desc, layout, force_fields, bytes_per_cell, plan}
+        # plan = [(mi, si, n), ...] 预先算好的分段读取计划，读一帧数据零计算开销。
+        # 只有初始化探测确认「可用」的传感器才会进 sensors；不可用的编号记进
+        # sensor_unavailable(原因)，后续任何读取会被本地直接拒绝，不上总线。
+        self.sensors: Dict[int, Dict] = {}
+        self.sensor_lengths: Dict[int, int] = {}   # {finger: 数据总长度}
+        self.available_sensors: List[int] = []     # 可用传感器编号（升序）
+        self.sensor_names: Dict[int, str] = {}     # {finger: 名称} 仅含可用
+        self.sensor_unavailable: Dict[int, str] = {}   # {finger: 不可用原因}
+        self.has_finger_sensors: bool = False      # 五指是否有传感器
+        self.has_palm_sensor: bool = False         # 手掌是否有传感器（本机通常无）
+        self._sensor_probed: bool = False          # 是否已完成可用性探测
+        self._probing_sensors: bool = False        # 探测进行中（暂不做可用性拦截）
+        self._selected_sensor: Optional[int] = None  # 当前已选传感器(免重复选择)
+
         # 响应匹配状态保护锁
         self._lock = threading.Lock()
 
@@ -752,10 +965,18 @@ class LinkerHandO30Controller:
         # 防止上一帧响应未到就发新帧导致响应被覆盖/错认。
         self._txn_lock = threading.Lock()
 
-        # 同步请求/应答：按当前在途请求的回显 MI 关联响应（杜绝写回显/陈旧帧污染）
+        # 同步请求/应答：按当前在途请求的回显 **MI + SI** 关联响应。
+        # ⚠️ 只比 MI 是不够的：同一 MI 下（尤其 MI 0x31 传感器命令）有几十个子索引，
+        #    上一次读的迟到响应或写(如选择传感器 0x6E)的回显 MI 完全相同，会被当成
+        #    本次读的应答 → 读到别的字段的内容（曾表现为「数据总长度=21332」，
+        #    21332=0x5354 正是类型串 "TS" 的两个字节）。故必须同时校验 SI。
         self._pending_event: Optional[threading.Event] = None
         self._pending_resp: Optional[bytes] = None
         self._pending_mi: Optional[int] = None
+        self._pending_si: Optional[int] = None
+        self._si_mismatch: Optional[Tuple[int, int]] = None   # 最近一次被丢弃的串扰帧
+        self._si_warned: bool = False                         # 串扰提示只打一次
+        self.strict_si_match: bool = True   # 固件若不回显 SI 可置 False 退回只比 MI
         self._last_tx: bytes = b''
 
         # 有效关节集合（向量型控制/解析的唯一依据）：先用静态 JOINT_MAP(valid=True)
@@ -777,12 +998,21 @@ class LinkerHandO30Controller:
     # 初始化 / 关闭
     # ------------------------------------------------------------------ #
     def initialize(self) -> bool:
-        """初始化通信层（委托给 self.comm）并完成上电准备"""
+        """初始化通信层（委托给 self.comm）并完成上电准备。
+
+        上电准备包含传感器可用性探测：probe_sensor=True 时逐个候选编号判定传感器
+        是否真的存在（类型/数据总长度/数据通道），可用的把「数据总长度/行/列/单位/
+        量程/分布描述/读取计划」缓存进 sensors，并把编号列表赋给 available_sensors；
+        不可用的（如本机没有手掌传感器）记进 sensor_unavailable，之后任何触觉读取
+        都会被本地直接拒绝，不会为不存在的传感器发帧等超时。
+        """
         if not self.comm.initialize():
             return False
 
         # 有效关节按 ACTIVE_JOINTS 静态固定（0D 00 24 自动探测在本机报错，已停用）。
         print(f"✅ 有效关节 {self.num_joints} 个")
+        if self._probe_sensor:
+            self.probe_sensors()
         print("✅ 初始化完成")
         print("=" * 50)
         return True
@@ -812,12 +1042,19 @@ class LinkerHandO30Controller:
             ev = self._pending_event
             if ev is None or not payload:
                 return
-            # 仅当回显 MI 与在途请求匹配（或为 0x4F 错误帧）时才认作本次响应，
-            # 否则忽略——防止写回显/陈旧帧覆盖正在等待的读响应。
+            # 仅当回显 MI **且 SI** 与在途请求匹配（或为 0x4F 错误帧）时才认作本次
+            # 响应，否则丢弃并继续等——防止写回显/同 MI 其它子索引的陈旧帧被错认。
             resp_mi = payload[0] & 0x7F
-            if resp_mi == self._pending_mi or resp_mi == MI.ERROR_CODE:
-                self._pending_resp = payload
-                ev.set()
+            resp_si = payload[1] if len(payload) > 1 else -1
+            if resp_mi != MI.ERROR_CODE:
+                if resp_mi != self._pending_mi:
+                    return
+                if self.strict_si_match and self._pending_si is not None \
+                        and resp_si != self._pending_si:
+                    self._si_mismatch = (resp_mi, resp_si)   # 串扰帧：记下、丢弃
+                    return
+            self._pending_resp = payload
+            ev.set()
 
     # ------------------------------------------------------------------ #
     # 组帧 / 收发
@@ -836,10 +1073,12 @@ class LinkerHandO30Controller:
     def _request(self, mi: int, si: int, length: int,
                  rts: int = RTS.REALTIME, timeout: float = 0.3) -> Optional[bytes]:
         """发送读请求并等待返回；校验回显帧头后返回剥离帧头、裁剪到 length 的载荷。
-        超时 / 帧头不符 / 设备回错误码帧，均返回 None。
+        超时 / 帧头(MI 或 SI)不符 / 设备回错误码帧，均返回 None。
 
         事务串行：整个「发送→等回复→取走」过程持 _txn_lock，确保同一时刻只有
         一个请求在途，新请求会等上一请求拿到回复或超时后才发出，避免响应被覆盖。
+        帧头校验同时比对 **MI 与 SI**：宁可本次超时返回 None，也不能把别的子索引
+        的响应当成本次结果——后者会静默产生错位数据（见 _process_response 注释）。
         """
         with self._txn_lock:
             ev = threading.Event()
@@ -847,24 +1086,35 @@ class LinkerHandO30Controller:
                 self._pending_event = ev
                 self._pending_resp = None
                 self._pending_mi = mi & 0x7F
+                self._pending_si = si & 0xFF
+                self._si_mismatch = None
 
             self._send_frame(self._tx_id, self._frame(mi, si, length, b'', rts))
             got = ev.wait(timeout)
 
             with self._lock:
                 body = self._pending_resp
+                mismatch = self._si_mismatch
                 self._pending_event = None
                 self._pending_resp = None
                 self._pending_mi = None
+                self._pending_si = None
 
         if not got or body is None or len(body) < 3:
+            if mismatch and not self._si_warned:
+                self._si_warned = True
+                print(f"⚠️ 收到 MI 匹配但 SI 不符的帧(MI=0x{mismatch[0]:02X} "
+                      f"SI=0x{mismatch[1]:02X}，本次请求 MI=0x{mi:02X} SI=0x{si:02X})，"
+                      f"已按串扰丢弃。若固件不回显 SI，请设 strict_si_match=False")
             return None
-        # 响应回显 3 字节帧头(MI/SI/EDL)；MI 不符 → 错误帧或串扰，丢弃
+        # 响应回显 3 字节帧头(MI/SI/EDL)；MI/SI 不符 → 错误帧或串扰，丢弃
         resp_mi = body[0] & 0x7F
         if resp_mi != (mi & 0x7F):
             if resp_mi == MI.ERROR_CODE and len(body) >= 4:
                 self.last_error_code = body[3]
                 print(f"⚠️ 设备返回错误码 0x{body[3]:02X}（请求 MI=0x{mi:02X} SI=0x{si:02X}）")
+            return None
+        if self.strict_si_match and body[1] != (si & 0xFF):
             return None
         return body[3:3 + length]
 
@@ -901,38 +1151,69 @@ class LinkerHandO30Controller:
 
     # ================================================================== #
     # 关节使能 / 故障（上电流程必需）
+    # ⚠️ 按 xlsx「协议格式」修正主索引：0x0C=关节故障(JointFault)，
+    #    0x0D=有效关节(JointBit)。旧代码两者互换，此处以协议为准。
     # ================================================================== #
     def enable_all_joints(self) -> bool:
-        """使能全部有效关节（写 0x0F=存在+可控+已使能+反馈）。上电后写位置前必须执行。"""
+        """使能全部有效关节（MI 0x0D 有效关节写 0x0F=存在+可控+已使能+反馈）。
+        上电后写位置前必须执行。空洞子索引(本机无电机)写 0，不会被误标为有效。"""
         return self._write(MI.JOINT_ENABLE, 0x00,
                            self._pack_u8([JointBit.ENABLE_DEFAULT] * self.num_joints))
 
     def set_joint_enable(self, masks: List[int]) -> bool:
-        """逐关节设置使能位掩码（见 JointBit）"""
+        """逐关节设置有效/使能位掩码（MI 0x0D，见 JointBit）"""
         if len(masks) != self.num_joints:
             return False
         return self._write(MI.JOINT_ENABLE, 0x00, self._pack_u8(masks))
 
     def get_joint_enable(self) -> Optional[List[int]]:
+        """读取有效关节的能力/使能位掩码（MI 0x0D，见 JointBit），按有效关节顺序返回。"""
         body = self._request(MI.JOINT_ENABLE, 0x00, self.phys_span)
         return self._unpack_u8(body) if body else None
 
     def get_joint_fault(self) -> Optional[List[int]]:
-        """读取有效关节的状态/能力位掩码 (MI=0x0D, 见 JointBit)。
-        ⚠️ spec 名为「关节故障」，但本固件返回的是存在/可控/使能/反馈等能力位
-           (非故障码)；按 si 探测整机有效关节请用 get_valid_joints()。"""
+        """读取各有效关节的故障位掩码（MI 0x0C 关节故障，见 JointFault / 关节故障码附表）。
+        返回按有效关节顺序的位掩码列表，0 表示无故障；逐位中文名见 decode_joint_fault。"""
         body = self._request(MI.JOINT_FAULT, 0x00, self.phys_span)
         return self._unpack_u8(body) if body else None
 
+    @staticmethod
+    def decode_joint_fault(mask: int) -> List[str]:
+        """把 MI 0x0C 的一个关节故障位掩码翻译成故障名称列表（无故障返回空表）。"""
+        return [name for bit, name in JOINT_FAULT_NAMES.items() if mask & bit]
+
+    def get_joint_faults(self) -> Optional[Dict[str, List[str]]]:
+        """读取并翻译全部有效关节的故障，返回 {关节名: [故障名, ...]}，仅含有故障者。"""
+        masks = self.get_joint_fault()
+        if masks is None:
+            return None
+        return {name: self.decode_joint_fault(m)
+                for name, m in zip(self.joint_names, masks) if m}
+
+    def print_joint_faults(self):
+        """打印各关节故障（MI 0x0C）。"""
+        faults = self.get_joint_faults()
+        if faults is None:
+            print("❌ 无法读取关节故障（0C 00 xx 超时/失败）")
+            return
+        if not faults:
+            print("✅ 全部有效关节无故障")
+            return
+        print("=" * 50)
+        print("关节故障:")
+        for name, items in faults.items():
+            print(f"  {name:15s}: {'、'.join(items)}")
+        print("=" * 50)
+
     def get_valid_joints(self) -> Optional[Dict[int, Dict]]:
-        """探测本机有效关节（发 0D 00 24：从子索引 0x00 读到 0x23，共 36 字节）。
+        """探测本机有效关节（发 0D 00 24：MI 0x0D 有效关节，子索引 0x00~0x23 共 36 字节）。
 
         上电流程第一步——返回每字节为该逻辑关节的存在/能力位掩码(见 JointBit)：
         非 0 即有效(实测 0x0B=存在+可控+反馈)，0 为无效(无对应电机)。结果按 si
         与 JOINT_MAP 比对，返回 {si: {name, description, mask}} 仅含有效关节。
         读取失败返回 None。可据此增删 JOINT_MAP 的条目(换型号时)。
         """
-        body = self._request(MI.JOINT_FAULT, 0x00, LOGICAL_JOINT_COUNT)
+        body = self._request(MI.JOINT_ENABLE, 0x00, LOGICAL_JOINT_COUNT)
         if not body:
             return None
         si2info = {j["si"]: j for j in JOINT_MAP.values()}
@@ -1022,11 +1303,45 @@ class LinkerHandO30Controller:
         """稀疏关节位置控制 (MI 0x30)：pairs=[(关节号, 位置0~255), ...]，省带宽。
         关节号即逻辑/物理子索引(与 MI=0x01 同一类型分组索引空间，见 JOINT_MAP)。
         例：弯五指 root1 → [(0x0A,200),(0x0B,200),(0x0C,200),(0x0D,200),(0x0E,200)]
+        ⚠️ xlsx「稀疏关节位置控制」标注本机固件仅支持前 19 组(SPARSE_MAX_PAIRS)，
+           超出部分会被截掉并告警；20 组以上为协议保留、本固件为「否」。
         """
+        if len(pairs) > SPARSE_MAX_PAIRS:
+            print(f"⚠️ 稀疏位置最多 {SPARSE_MAX_PAIRS} 组，收到 {len(pairs)} 组，超出部分已截掉")
+            pairs = pairs[:SPARSE_MAX_PAIRS]
         data = bytearray()
         for jn, pos in pairs:
-            data += bytes([jn & 0xFF, int(pos) & 0xFF])
+            data += bytes([jn & 0xFF, max(0, min(U8_MAX, int(pos)))])
         return self._write(MI.SPARSE_POS, 0x00, bytes(data))
+
+    # ---- 增量型位置控制（MI 0x0E 增 / 0x0F 减，单字节向量，与 0x01 同一索引空间） ---- #
+    def set_position_increment(self, deltas: List[int]) -> bool:
+        """各有效关节目标位置「增」指定增量（MI 0x0E，单字节 0~255）。
+        入参个数须等于 self.num_joints；0 表示该关节不动。"""
+        if len(deltas) != self.num_joints:
+            print(f"❌ 需要 {self.num_joints} 个增量，收到 {len(deltas)}")
+            return False
+        return self._write(MI.INC_POSITION, 0x00, self._pack_u8(deltas))
+
+    def set_position_decrement(self, deltas: List[int]) -> bool:
+        """各有效关节目标位置「减」指定增量（MI 0x0F，单字节 0~255）。
+        入参个数须等于 self.num_joints；0 表示该关节不动。"""
+        if len(deltas) != self.num_joints:
+            print(f"❌ 需要 {self.num_joints} 个增量，收到 {len(deltas)}")
+            return False
+        return self._write(MI.DEC_POSITION, 0x00, self._pack_u8(deltas))
+
+    def step_joint_position(self, joint: str, delta: int) -> bool:
+        """按名称给单个关节做增量位置控制（delta>0 走 MI 0x0E，delta<0 走 0x0F）。
+        只发 1 帧 1 字节，适合手柄/摇杆类高频微调。"""
+        if joint not in self.joint_si:
+            print(f"❌ 未知关节 {joint}，可选 {self.joint_names}")
+            return False
+        step = max(-U8_MAX, min(U8_MAX, int(delta)))
+        if step == 0:
+            return True
+        mi = MI.INC_POSITION if step > 0 else MI.DEC_POSITION
+        return self._write(mi, self.joint_si[joint], bytes([abs(step)]))
 
     # ---- 按指 / 按名 / 按类型 局部写位置（单字节, 只发涉及关节，不必凑齐 25 个） ---- #
     def set_group_position(self, group: str, values: List[int]) -> bool:
@@ -1132,6 +1447,7 @@ class LinkerHandO30Controller:
     def set_target_velocity(self, velocities: List[int]) -> bool:
         if len(velocities) != self.num_joints:
             return False
+        print(f"设置目标速度: {velocities}")
         return self._write(MI.VELOCITY, 0x00, self._pack_u8(velocities))
 
     def get_current_velocity(self) -> Optional[List[int]]:
@@ -1191,7 +1507,9 @@ class LinkerHandO30Controller:
 
     def get_sensor_type(self) -> Optional[str]:
         """读传感器类型（工程服务 0x42/0x4A 的 uint8 枚举，见 SENSOR_TYPE_ENUM）。
-        报文 42 4A 01。未知值返回 '未知(0xNN)'，读取失败返回 None。"""
+        报文 42 4A 01。未知值返回 '未知(0xNN)'，读取失败返回 None。
+        ⚠️ xlsx v0.0.4 未列出该子索引，本机固件可能不支持；传感器真实类型请用
+           get_sensor_info()['type']（MI 0x31 SI 0x00 字符串）。"""
         b = self._request(MI.ENGINEERING, EngineeringSI.SENSOR_TYPE, 1)
         if not b:
             return None
@@ -1199,50 +1517,515 @@ class LinkerHandO30Controller:
 
     # ================================================================== #
     # 错误码（MI=0x4F，只读）
+    # ------------------------------------------------------------------ #
+    # SI 0x00 = 最新一次错误所在的历史槽号(1~15)；SI 0x01~0x0F = 15 条历史错误码。
+    # 每条错误码是 bit0~bit5 的可组合标志（见 ErrorCode / ERROR_CODE_NAMES）。
     # ================================================================== #
-    def get_last_error(self) -> Optional[int]:
-        """读最新通信错误码（0x00=正常，见 ErrorCode）"""
-        idx = self._request(MI.ERROR_CODE, 0x00, 1)
+    def get_last_error_index(self) -> Optional[int]:
+        """读最新一次错误所在的历史槽号（1~15；0 表示尚无错误记录）"""
+        idx = self._request(MI.ERROR_CODE, ERROR_LATEST_INDEX_SI, 1)
         return idx[0] if idx else None
 
-    # ================================================================== #
-    # 触觉传感器（MI 0x31 命令 + 0x32/0x33/0x34 数据通道）
-    # ================================================================== #
-    def select_sensor(self, finger: int) -> bool:
-        """选择要读取的手指传感器（见 SensorFinger，1拇指 ~ 6手掌）"""
-        return self._write(MI.SENSOR_CMD, 0x2D, bytes([finger & 0xFF]))
-
-    def get_sensor_total_length(self) -> Optional[int]:
-        """读当前所选传感器的数据总长度（字节，小端 uint16）"""
-        body = self._request(MI.SENSOR_CMD, 0x2B, 2)
-        return int.from_bytes(body[:2], 'little') if body and len(body) >= 2 else None
-
-    def get_sensor_info(self) -> Optional[Dict]:
-        """读传感器元信息（须先 select_sensor）：类型/单位/量程/行/列/总长"""
-        typ = self._request(MI.SENSOR_CMD, 0x00, 32)
-        if typ is None:
+    def get_error_at(self, index: int) -> Optional[int]:
+        """读第 index 条历史错误码（index 取 1~15）"""
+        if not 1 <= index <= ERROR_HISTORY_COUNT:
             return None
-        unit   = self._request(MI.SENSOR_CMD, 0x20, 8)  or b''
-        srange = self._request(MI.SENSOR_CMD, 0x28, 1)  or b'\x00'
-        rows   = self._request(MI.SENSOR_CMD, 0x29, 1)  or b'\x00'
-        cols   = self._request(MI.SENSOR_CMD, 0x2A, 1)  or b'\x00'
-        total  = self.get_sensor_total_length() or 0
+        b = self._request(MI.ERROR_CODE, index, 1)
+        return b[0] if b else None
+
+    def get_last_error(self) -> Optional[int]:
+        """读最新一次通信错误码（0x00=正常，见 ErrorCode）。
+        先取最新槽号(SI 0x00)，再按槽号读该条错误码；槽号为 0 时返回 0x00。"""
+        idx = self.get_last_error_index()
+        if idx is None:
+            return None
+        if idx == 0:
+            return ErrorCode.OK
+        return self.get_error_at(idx)
+
+    def get_error_history(self) -> Optional[List[int]]:
+        """读全部 15 条历史错误码（SI 0x01~0x0F），返回按槽号 1~15 排列的列表"""
+        out = []
+        for i in range(1, ERROR_HISTORY_COUNT + 1):
+            b = self._request(MI.ERROR_CODE, i, 1)
+            if b is None:
+                return None
+            out.append(b[0])
+        return out
+
+    @staticmethod
+    def decode_error_code(code: int) -> List[str]:
+        """把通信错误码按位解成中文描述列表（0x00 返回 ['正常']）"""
+        if code == ErrorCode.OK:
+            return ["正常"]
+        return [name for bit, name in ERROR_CODE_NAMES.items() if code & bit] or \
+               [f"未知(0x{code:02X})"]
+
+    def print_error_history(self):
+        """打印最新错误槽号与 15 条历史错误码解析结果"""
+        idx = self.get_last_error_index()
+        hist = self.get_error_history()
+        if hist is None:
+            print("❌ 错误码读取失败")
+            return
+        print("=" * 50)
+        print(f"通信错误码（最新槽号={idx}）:")
+        for i, code in enumerate(hist, start=1):
+            mark = " ←最新" if i == idx else ""
+            print(f"  [{i:2d}] 0x{code:02X}  {'、'.join(self.decode_error_code(code))}{mark}")
+        print("=" * 50)
+
+    # ================================================================== #
+    # 触觉传感器（MI 0x31 命令/元信息 + 0x32/0x33/0x34 数据通道）
+    # ------------------------------------------------------------------ #
+    # 初始化必须走的流程（每个传感器一遍，全部结果缓存）：
+    #   ① 读数据分布描述(0x2B)  ② 选择传感器(0x6E)  ③ 读最大行/列(0x29/0x2A)
+    #   ④ 把最大行/列写到数据行/列(0x6F/0x70)      ⑤ 读数据总长度(0x6C)
+    # 实现上把「选择」提到最前（②→①）：0x2B/0x29/0x2A/0x6C 读的都是**当前所选**
+    # 传感器的属性，不先选就会读到上一个传感器的值。其余次序与上表一致。
+    #
+    # 运行期（高频路径）只剩两步，不再发任何元信息帧：
+    #   选择传感器(0x6E，已选中则连这帧也省) → 按缓存的数据总长度读 SI 0x00 起的数据
+    # 每帧最多取 MAX_LD=61 字节(CAN FD 64 - 3 帧头)，每通道覆盖 255 字节，
+    # 分段方案在初始化时已预生成为 info["plan"]，运行期零计算。
+    #
+    # ⚠️ 数据区不是纯点阵：按 0x2B 的分布描述，开头通常是 法向力合力/切向力合力/
+    #    合力方向 等 uint16 标量，点阵在其后。合力值没有独立寄存器，与点阵一次读回，
+    #    解析见 parse_tactile()。示例描述：
+    #      FnS_U16_1;FtS_U16_1;FdS_U16_1;Rsv_U16_1;Fn_U8_40
+    #      = 1×uint16 法向力合力 + 1×uint16 切向力合力 + 1×uint16 合力方向
+    #        + 1×uint16 保留 + 40 个 uint8 点阵值（共 48 字节）
+    # ================================================================== #
+    @staticmethod
+    def _decode_sensor_desc(raw: Optional[bytes]) -> str:
+        """把 0x2B 读回的字节还原成分布描述字符串。
+
+        设备按固定长度回填，尾部可能是 0x00 或随机填充；只取**开头连续的可打印
+        ASCII**，遇到 NUL/非打印字符即截断，避免把填充字节当成字段名。
+        """
+        if not raw:
+            return ''
+        out = []
+        for b in raw:
+            if 0x20 <= b < 0x7F:
+                out.append(chr(b))
+            else:
+                break
+        return ''.join(out).strip()
+
+    @staticmethod
+    def _looks_like_sensor_desc(desc: str) -> bool:
+        """粗判一段字符串是否是分布描述（形如 Tag_TYPE_N，可用 ';' 拼接）。"""
+        if not desc or '_' not in desc:
+            return False
+        for seg in desc.split(';'):
+            parts = seg.strip().rsplit('_', 2)
+            if len(parts) == 3 and parts[1].upper() in SENSOR_FIELD_TYPE_SIZE \
+                    and parts[2].isdigit():
+                return True
+        return False
+
+    @staticmethod
+    def _parse_sensor_layout(desc: str) -> List[Dict]:
+        """解析「数据分布描述」为字段列表（顺序即数据区排布顺序）。
+
+        输入形如 ``FnS_U16_1;FtS_U16_1;FdS_U16_1;Rsv_U16_1;Fn_U8_40``，
+        每段 ``<标签>_<类型>_<个数>``。返回:
+        ``[{tag,name,type,signed,elem_size,count,offset,size}, ...]``
+        无法解析的段跳过并告警；描述为空时返回 []（调用方回退到纯点阵假设）。
+        """
+        fields: List[Dict] = []
+        off = 0
+        for seg in (desc or '').split(';'):
+            seg = seg.strip()
+            if not seg:
+                continue
+            parts = seg.rsplit('_', 2)          # 标签本身可能含下划线，从右侧切
+            if len(parts) != 3:
+                print(f"⚠️ 传感器分布描述字段无法解析: {seg!r}")
+                continue
+            tag, typ, cnt = parts[0], parts[1].upper(), parts[2]
+            elem = SENSOR_FIELD_TYPE_SIZE.get(typ)
+            if elem is None or not cnt.isdigit():
+                print(f"⚠️ 传感器分布描述字段无法解析: {seg!r}")
+                continue
+            count = int(cnt)
+            fields.append({
+                "tag":       tag,
+                "name":      SENSOR_FIELD_NAMES.get(tag, tag),
+                "type":      typ,
+                "signed":    typ in SENSOR_FIELD_SIGNED,
+                "elem_size": elem,
+                "count":     count,
+                "offset":    off,
+                "size":      elem * count,
+            })
+            off += elem * count
+        return fields
+
+    def probe_sensors(self, fingers: Tuple[int, ...] = SENSOR_PROBE_ORDER,
+                      force: bool = False, apply_shape: bool = True,
+                      verify_data: bool = True) -> Dict[int, Dict]:
+        """探测传感器**可用性**，并缓存可用者的元信息、字段布局与读取计划。
+
+        对每个候选编号(1拇指~5小指, 6手掌)按规定流程逐项判定，任一步不过即判为
+        「不可用」并记入 self.sensor_unavailable，**不进 self.sensors**：
+          ① 选择传感器(0x6E) 写失败                    → 不可用「选择失败」
+          ② 传感器类型(0x00) 读不到 / 为空 / NO_SENSOR  → 不可用「未安装」
+          ③ 数据总长度(0x6C) 为 0 或超出三通道上限且无法
+             由分布描述推算                             → 不可用「数据总长度无效」
+          ④ verify_data=True 时试读数据通道首帧失败      → 不可用「数据通道无响应」
+        通过的按次序读分布描述(0x2B)/最大行列(0x29,0x2A)/单位/量程，把最大行列写到
+        数据行列(0x6F/0x70，apply_shape=True 且与读回值不一致时才写)，再读数据总
+        长度(0x6C)，解析字段布局并预生成分段读取计划。
+
+        探测结果同时落到这些实例变量，运行期直接查、不再上总线：
+          available_sensors / sensor_names / sensor_lengths / sensors
+          sensor_unavailable / has_finger_sensors / has_palm_sensor
+        探测完成后，读取不可用编号会被本地直接拒绝（见 select_sensor）。
+        force=False 时若已探测过则直接返回缓存。返回 {finger: 传感器信息字典}。
+        """
+        if self._sensor_probed and not force:
+            return self.sensors
+        sensors: Dict[int, Dict] = {}
+        unavailable: Dict[int, str] = {}
+        self._probing_sensors = True          # 探测期间不做可用性拦截
+        try:
+            for finger in fingers:
+                info, reason = self._collect_sensor_info(finger, apply_shape=apply_shape,
+                                                         verify_data=verify_data)
+                if info:
+                    sensors[finger] = info
+                else:
+                    unavailable[finger] = reason or "不可用"
+        finally:
+            self._probing_sensors = False
+        self._set_sensor_cache(sensors, unavailable)
+        self._sensor_probed = True
+        self._print_sensor_probe_result()
+        return self.sensors
+
+    def _set_sensor_cache(self, sensors: Dict[int, Dict], unavailable: Dict[int, str]):
+        """把探测结果写入各缓存变量，并把当前选择落到一个真实存在的传感器上。"""
+        self.sensors = sensors
+        self.sensor_lengths = {f: v["total_length"] for f, v in sensors.items()}
+        self.available_sensors = sorted(sensors)
+        self.sensor_names = {f: v["name"] for f, v in sensors.items()}
+        self.sensor_unavailable = unavailable
+        self.has_finger_sensors = any(f != SensorFinger.PALM for f in sensors)
+        self.has_palm_sensor = SensorFinger.PALM in sensors
+        if self.available_sensors:
+            # 探测过程可能停在「无传感器」的编号上，收尾落回第一个可用传感器
+            self.select_sensor(self.available_sensors[0], force=True)
+        else:
+            self._selected_sensor = None
+
+    def _print_sensor_probe_result(self):
+        """打印可用/不可用传感器清单（初始化时给一眼看清的结论）。"""
+        if self.sensors:
+            desc = "  ".join(f"{v['name']}={v['total_length']}B"
+                             f"({v['rows']}x{v['cols']})" for v in self.sensors.values())
+            print(f"✅ 可用传感器 {len(self.sensors)} 个 {self.available_sensors}，"
+                  f"长度已缓存: {desc}")
+            forces = [v['name'] for v in self.sensors.values() if v["force_fields"]]
+            if forces:
+                print(f"   合力字段随数据区一并返回: {'、'.join(forces)}")
+        else:
+            print("ℹ️ 未探测到可用传感器，所有触觉读取接口将直接返回 None")
+        if self.sensor_unavailable:
+            miss = "  ".join(f"{SENSOR_FINGER_NAMES.get(f, f)}({r})"
+                             for f, r in sorted(self.sensor_unavailable.items()))
+            print(f"ℹ️ 不可用传感器 {len(self.sensor_unavailable)} 个: {miss}")
+
+    def _collect_sensor_info(self, finger: int, apply_shape: bool = True,
+                             verify_data: bool = True) -> Tuple[Optional[Dict], str]:
+        """按规定流程读齐单个传感器的元信息并组装缓存条目。
+
+        次序：选择(0x6E) → 类型(0x00，可用性判据) → 分布描述(0x2B) →
+        最大行/列(0x29/0x2A) → 写数据行/列(0x6F/0x70) → 数据总长度(0x6C)
+        → 解析布局 → 预生成分段读取计划 → (可选)试读首帧确认数据通道。
+
+        返回 (info, reason)：可用时 info 为缓存条目、reason 为 ''；
+        不可用时 info 为 None、reason 是中文原因（用于 sensor_unavailable）。
+        """
+        name = SENSOR_FINGER_NAMES.get(finger, f"传感器{finger}")
+        # 选择传感器：必须最先做，之后 0x2B/0x29/0x2A/0x6C 读的才是这一个的属性
+        if not self.select_sensor(finger, force=True):
+            return None, "选择失败"
+        # 传感器类型是最可靠的“装没装”判据：未装时为空或 NO_SENSOR
+        typ = self._request(MI.SENSOR_CMD, *SensorSI.TYPE)
+        if typ is None:
+            return None, "类型无响应"
+        typ_s = typ.decode('utf-8', 'ignore').rstrip('\x00').strip()
+        if not typ_s or typ_s.upper().startswith(SensorType.NO_SENSOR):
+            return None, "未安装"
+        # 分布描述(0x2B) + 最大行/列(0x29/0x2A) + 单位/量程
+        info = self._read_sensor_meta(sensor_type=typ_s)
+        info["finger"] = finger
+        info["name"] = name
+        # 把最大行/列写到数据行/列(0x6F/0x70)——与读回值一致时不写，省帧
+        if apply_shape and info["rows"] and info["cols"]:
+            cur_r = self._request(MI.SENSOR_CMD, SensorSI.DATA_ROWS, 1)
+            cur_c = self._request(MI.SENSOR_CMD, SensorSI.DATA_COLS, 1)
+            if cur_r and cur_r[0] != info["rows"]:
+                self._write(MI.SENSOR_CMD, SensorSI.DATA_ROWS, bytes([info["rows"]]))
+            if cur_c and cur_c[0] != info["cols"]:
+                self._write(MI.SENSOR_CMD, SensorSI.DATA_COLS, bytes([info["cols"]]))
+        # 数据总长度(0x6C)——三通道最多覆盖 765 字节，超出即视为读到了脏数据
+        limit = SENSOR_CHANNEL_SPAN * len(SENSOR_CHANNEL_MIS)
+        expect = sum(f["size"] for f in self._parse_sensor_layout(info["dist_desc"]))
+        total = self.get_sensor_total_length()
+        if total and total > limit:
+            print(f"⚠️ {name}数据总长度读回 {total} 字节不合理(三通道上限 {limit})，重读一次")
+            again = self.get_sensor_total_length()
+            total = again if (again and again <= limit) else None
+        if not total:
+            if 0 < expect <= limit:      # 描述可信：按各字段之和推算
+                print(f"ℹ️ {name}数据总长度不可用，按分布描述 {info['dist_desc']} "
+                      f"推算为 {expect} 字节")
+                total = expect
+            else:
+                return None, "数据总长度无效"
+        info["total_length"] = total
+        self._apply_sensor_layout(info)
+        info["plan"] = self._build_sensor_plan(total)
+        if not info["plan"]:
+            return None, "读取计划为空"
+        # 试读数据通道首帧，确认数据区真的能读（部分固件只有 0x32 通道可用）
+        if verify_data:
+            mi, si, n = info["plan"][0]
+            if self._request(mi, si, n) is None:
+                return None, "数据通道无响应"
+        return info, ""
+
+    @staticmethod
+    def _apply_sensor_layout(info: Dict):
+        """由分布描述解析字段布局，填充 layout/force_fields/matrix_* /bytes_per_cell。
+
+        分布描述缺失或解析不出点阵字段时，回退到「整段数据都是点阵」的旧假设：
+        matrix_offset=0，每格字节数 = 总长 ÷ (行×列)。
+        """
+        rows, cols, total = info["rows"], info["cols"], info["total_length"]
+        cells = rows * cols
+        layout = LinkerHandO30Controller._parse_sensor_layout(info.get("dist_desc", ""))
+        info["layout"] = layout
+        info["layout_length"] = sum(f["size"] for f in layout)
+        info["force_fields"] = [f for f in layout
+                                if f["count"] == 1 and f["tag"] in SENSOR_FORCE_TAGS]
+        # 点阵字段：优先取标签匹配的，否则取个数最大且 >1 的字段
+        mat = next((f for f in layout if f["tag"] in SENSOR_MATRIX_TAGS and f["count"] > 1),
+                   None)
+        if mat is None:
+            cand = [f for f in layout if f["count"] > 1]
+            mat = max(cand, key=lambda f: f["count"]) if cand else None
+        if mat is not None:
+            info["matrix_field"]   = mat
+            info["matrix_offset"]  = mat["offset"]
+            info["matrix_count"]   = mat["count"]
+            info["bytes_per_cell"] = mat["elem_size"]
+            if cells and mat["count"] != cells:
+                print(f"⚠️ {info['name']}分布描述点阵数 {mat['count']} 与行×列 "
+                      f"{rows}x{cols}={cells} 不一致，按分布描述为准")
+        else:
+            info["matrix_field"]   = None
+            info["matrix_offset"]  = 0
+            info["matrix_count"]   = cells
+            info["bytes_per_cell"] = max(1, total // cells) if cells else 1
+        if layout and info["layout_length"] != total:
+            print(f"⚠️ {info['name']}分布描述总长 {info['layout_length']} 字节与数据总长度 "
+                  f"{total} 字节不一致（按各字段偏移解析，多余字节忽略）")
+
+    def _read_sensor_meta(self, sensor_type: Optional[str] = None) -> Dict:
+        """读当前所选传感器的静态元信息（不含总长度）。仅探测阶段使用。
+
+        次序按规定流程：分布描述(0x2B) → 最大行(0x29) → 最大列(0x2A)，
+        之后才补读单位(0x20)/量程(0x28)。sensor_type 已在可用性判定时读过时传进来，
+        避免重复读 0x00 的 32 字节。
+        """
+        if sensor_type is None:
+            typ = self._request(MI.SENSOR_CMD, *SensorSI.TYPE) or b''
+            sensor_type = typ.decode('utf-8', 'ignore').rstrip('\x00').strip()
+        desc   = self._read_sensor_dist_desc()
+        rows   = self._request(MI.SENSOR_CMD, SensorSI.MAX_ROWS, 1) or b'\x00'
+        cols   = self._request(MI.SENSOR_CMD, SensorSI.MAX_COLS, 1) or b'\x00'
+        unit   = self._request(MI.SENSOR_CMD, *SensorSI.UNIT)      or b''
+        srange = self._request(MI.SENSOR_CMD, SensorSI.RANGE, 1)    or b'\x00'
         return {
-            "type":         typ.decode('utf-8', 'ignore').rstrip('\x00'),
-            "unit":         unit.decode('utf-8', 'ignore').rstrip('\x00'),
-            "range":        srange[0],
-            "rows":         rows[0],
-            "cols":         cols[0],
-            "total_length": total,
+            "type":      sensor_type,
+            "unit":      unit.decode('utf-8', 'ignore').rstrip('\x00').strip(),
+            "range":     srange[0],
+            "rows":      rows[0],
+            "cols":      cols[0],
+            "dist_desc": desc,
         }
 
+    def _read_sensor_dist_desc(self) -> str:
+        """读当前所选传感器的「数据分布描述」（MI 0x31 SI 0x2B），返回 ASCII 描述串。
+
+        0x2B 有两种固件实现，这里先用 **EDL=1 探一个字节** 再决定怎么读——对只有
+        1 字节的子索引直接请求 64 字节可能被固件判为非法长度：
+          · 首字节是字母  → 0x2B 本身就是描述串，接着整段读回来；
+          · 首字节是 1~64 → 0x2B 是描述长度，内容在 0x2C（xlsx 表格行的表述，
+                            实机固件即此种：0x2B=8、0x2C="Fn_U8_70"）；
+          · 首字节为 0    → 该传感器没有描述（手掌无传感器时即为 0）。
+        两条路都拿不到就返回 ''（调用方回退到「整段都是点阵」的假设）。
+        """
+        head = self._request(MI.SENSOR_CMD, SensorSI.DIST_DESC[0], 1)
+        if not head:
+            return ''
+        b0 = head[0]
+        if 0x20 <= b0 < 0x7F and chr(b0).isalpha():          # 0x2B = 描述串本身
+            desc = self._read_desc_string(SensorSI.DIST_DESC[0], SensorSI.DIST_DESC[1])
+            if desc:
+                return desc
+        if 0 < b0 <= SensorSI.DIST_DESC_ALT[1]:              # 0x2B = 长度, 0x2C = 内容
+            desc = self._read_desc_string(SensorSI.DIST_DESC_ALT[0], b0)
+            if desc:
+                return desc
+        if b0:
+            print(f"ℹ️ 分布描述(0x2B 首字节 0x{b0:02X})既不像描述串也不像长度，"
+                  f"按整段点阵解析")
+        return ''
+
+    def _read_desc_string(self, si: int, length: int) -> str:
+        """从 si 起读一段描述字符串：长度上限 length，单帧装不下时按可行长度递减重试。
+        （固件对超出字段长度的 EDL 可能直接回错误码，故逐档试探。）"""
+        want = min(length, MAX_LD)
+        for n in (want, 48, 32, 16, 8):
+            if n > want:
+                continue
+            desc = self._decode_sensor_desc(
+                self._request(MI.SENSOR_CMD, si, n))
+            if self._looks_like_sensor_desc(desc):
+                return desc
+        return ''
+
+    @staticmethod
+    def _build_sensor_plan(total: int) -> List[Tuple[int, int, int]]:
+        """把「数据总长度」拆成 [(MI, SI, 本帧字节数), ...] 的读取计划。
+        通道划分：0x32=[0,255) 0x33=[255,510) 0x34=[510,765)，各通道 SI 从 0 起。"""
+        plan: List[Tuple[int, int, int]] = []
+        off = 0
+        while off < total:
+            ch = off // SENSOR_CHANNEL_SPAN
+            if ch >= len(SENSOR_CHANNEL_MIS):
+                print(f"⚠️ 传感器数据总长 {total} 字节超出 0x32/0x33/0x34 三通道覆盖范围"
+                      f"({SENSOR_CHANNEL_SPAN * len(SENSOR_CHANNEL_MIS)} 字节)，超出部分不读")
+                break
+            si = off % SENSOR_CHANNEL_SPAN
+            n = min(MAX_LD, total - off, SENSOR_CHANNEL_SPAN - si)
+            plan.append((SENSOR_CHANNEL_MIS[ch], si, n))
+            off += n
+        return plan
+
+    # ---- 传感器可用性（全部纯缓存查询，不发帧） ---- #
+    def is_sensor_available(self, finger: int) -> bool:
+        """该传感器是否可用（初始化探测结论，纯缓存查询）。
+        未做过探测时返回 True——此时无从判断，交由实读决定。"""
+        if not self._sensor_probed:
+            return True
+        return finger in self.sensors
+
+    def get_available_sensors(self) -> List[int]:
+        """可用传感器编号列表（升序），不发帧。例：[1,2,3,4,5] 表示只有五指有传感器。"""
+        return list(self.available_sensors)
+
+    def get_unavailable_sensors(self) -> Dict[int, str]:
+        """不可用传感器及原因 {finger: 原因}，不发帧。例：{6: '未安装'}。"""
+        return dict(self.sensor_unavailable)
+
+    def _sensor_unavailable_msg(self, finger: int) -> str:
+        name = SENSOR_FINGER_NAMES.get(finger, f"传感器{finger}")
+        reason = self.sensor_unavailable.get(finger, "未探测到")
+        return (f"❌ {name}传感器不可用({reason})，本机可用传感器: "
+                f"{[SENSOR_FINGER_NAMES.get(f, f) for f in self.available_sensors]}")
+
+    def select_sensor(self, finger: int, force: bool = False) -> bool:
+        """选择要读取的传感器（MI 0x31 SI 0x6E，见 SensorFinger：1拇指~5小指, 6手掌）。
+
+        force=False 时，若目标已是当前所选传感器则直接返回 True 不发帧——高频
+        连续读同一传感器时省掉一半帧。
+        初始化探测已判定不可用的编号（如本机没有手掌传感器）在此**直接拒绝、
+        不上总线**，避免为不存在的传感器反复等超时。
+        """
+        if self._sensor_probed and not self._probing_sensors \
+                and finger not in self.sensors:
+            print(self._sensor_unavailable_msg(finger))
+            return False
+        if not force and self._selected_sensor == finger:
+            return True
+        ok = self._write(MI.SENSOR_CMD, SensorSI.SELECT, bytes([finger & 0xFF]))
+        self._selected_sensor = finger if ok else None
+        return ok
+
+    def get_selected_sensor(self) -> Optional[int]:
+        """回读设备当前所选传感器编号（MI 0x31 SI 0x6E），并同步本地记录。"""
+        body = self._request(MI.SENSOR_CMD, SensorSI.SELECT, 1)
+        if not body:
+            return None
+        self._selected_sensor = body[0]
+        return body[0]
+
+    def get_sensor_total_length(self) -> Optional[int]:
+        """读当前所选传感器的数据总长度（MI 0x31 SI 0x6C，小端 uint16）。
+        ⚠️ 高频场景请改用 get_sensor_length()（走初始化缓存，不发帧）。"""
+        body = self._request(MI.SENSOR_CMD, *SensorSI.TOTAL_LENGTH)
+        return int.from_bytes(body[:2], 'little') if body and len(body) >= 2 else None
+
+    def get_sensor_length(self, finger: Optional[int] = None) -> Optional[int]:
+        """取传感器数据总长度——纯缓存查询，不发任何帧（初始化时已探测）。
+        finger 为 None 时取当前所选传感器。缓存里没有则返回 None。"""
+        if finger is None:
+            finger = self._selected_sensor
+        return self.sensor_lengths.get(finger) if finger is not None else None
+
+    def get_sensor_info(self, finger: Optional[int] = None, refresh: bool = False,
+                        apply_shape: bool = True) -> Optional[Dict]:
+        """取传感器元信息：类型/单位/量程/行/列/总长/分布描述/字段布局/每格字节数。
+
+        默认走 initialize() 阶段的缓存（不发帧）；refresh=True 时重新选择该传感器
+        并实读一遍元信息并更新缓存。finger 为 None 时取当前所选传感器。
+        apply_shape=False 时不把最大行/列写回数据行/列（用于手动改过形态后刷新缓存）。
+        """
+        if finger is None:
+            finger = self._selected_sensor
+        if finger is None:
+            return None
+        if not refresh and finger in self.sensors:
+            return self.sensors[finger]
+        if self._sensor_probed and finger not in self.sensors:
+            print(self._sensor_unavailable_msg(finger))   # 不可用：本地拒绝，不上总线
+            return None
+        info, _ = self._collect_sensor_info(finger, apply_shape=apply_shape)
+        if info is None:
+            return None
+        self.sensors[finger] = info
+        self.sensor_lengths[finger] = info["total_length"]
+        self.sensor_names[finger] = info["name"]
+        self.sensor_unavailable.pop(finger, None)
+        if finger not in self.available_sensors:
+            self.available_sensors = sorted(self.sensors)
+        return info
+
+    def _read_plan(self, plan: List[Tuple[int, int, int]]) -> Optional[bytes]:
+        """按预生成的读取计划顺序取数据；任一段失败即返回 None（避免半帧数据）。"""
+        out = bytearray()
+        for mi, si, n in plan:
+            body = self._request(mi, si, n)
+            if not body:
+                return None
+            out += body
+            if len(body) < n:      # 设备返回不足，认为读到末尾
+                break
+        return bytes(out)
+
     def _read_sensor_channel(self, mi: int, count: int) -> bytes:
-        """从某数据通道(本地 SI 偏移 0 起)分段读 count 字节，每段≤61(CAN FD 单帧)。
-        SI 为单字节，故单通道最多覆盖 256 字节(协议分通道正是此原因)。"""
+        """从某数据通道(本地 SI 偏移 0 起)分段读 count 字节，每段≤MAX_LD(CAN FD 单帧)。
+        单通道最多覆盖 SENSOR_CHANNEL_SPAN=255 字节(协议分三通道正是此原因)。"""
         out = bytearray()
         off = 0
-        while off < count and off <= 0xFF:
-            n = min(61, count - off, 0x100 - off)
+        while off < count and off < SENSOR_CHANNEL_SPAN:
+            n = min(MAX_LD, count - off, SENSOR_CHANNEL_SPAN - off)
             body = self._request(mi, off, n)
             if not body:
                 break
@@ -1253,52 +2036,302 @@ class LinkerHandO30Controller:
         return bytes(out)
 
     def read_tactile_raw(self, finger: Optional[int] = None) -> Optional[bytes]:
-        """读取触觉完整原始数据（文档§2.7 流程）。
-        finger 给定时先选指；为 None 时读当前已选传感器。
-        通道划分：0x32=[0,255)  0x33=[255,511)  0x34=[511, 末尾)。
-        """
-        if finger is not None:
-            if not self.select_sensor(finger):
-                return None
-            time.sleep(0.005)
-        total = self.get_sensor_total_length()
-        if not total:
-            return None
-        data = bytearray()
-        data += self._read_sensor_channel(MI.SENSOR_DATA1, min(255, total))
-        if total > 255:
-            data += self._read_sensor_channel(MI.SENSOR_DATA2, min(256, total - 255))
-        if total > 511:
-            data += self._read_sensor_channel(MI.SENSOR_DATA3, total - 511)
-        return bytes(data[:total])
+        """读取触觉完整原始数据（高频路径）。
 
-    def read_tactile_matrix(self, finger: int) -> Optional[List[List[int]]]:
-        """读取触觉并按行优先还原为二维矩阵。
-        每格字节数 = 总长 ÷ (行×列)，自动判定 1 或 2 字节/格(小端)。
+        finger 给定时先选该传感器（已选中则不发选择帧）；为 None 时读当前所选。
+        长度与分段计划全部来自初始化缓存，**不发元信息帧**；缓存缺失且未做过探测
+        时才回退到实读一次元信息补建缓存。
+        初始化已判定不可用的编号（本机手掌）直接返回 None，不上总线。
+        返回的是数据区原始字节：开头是分布描述里的合力等标量，点阵在其后，
+        解析用 parse_tactile() / get_tactile_force() / read_tactile_matrix()。
         """
-        if not self.select_sensor(finger):
+        target = finger if finger is not None else self._selected_sensor
+        if target is None:
+            print("❌ 未选择传感器，请先 select_sensor(...)")
             return None
-        time.sleep(0.005)
-        info = self.get_sensor_info()
-        if not info:
+        if self._sensor_probed and target not in self.sensors:
+            print(self._sensor_unavailable_msg(target))
             return None
-        rows, cols, total = info["rows"], info["cols"], info["total_length"]
-        if rows == 0 or cols == 0:
+        if finger is not None and not self.select_sensor(finger):
             return None
-        raw = self.read_tactile_raw(finger=None)
+        cached = self.sensors.get(target)
+        if cached is None:          # 未探测过 → 实读一次元信息补建缓存
+            cached = self.get_sensor_info(target, refresh=True)
+            if cached is None:
+                return None
+        data = self._read_plan(cached["plan"])
+        return data[:cached["total_length"]] if data else None
+
+    # ---- 数据区解析（合力标量 + 点阵，全部来自同一次读取） ---- #
+    @staticmethod
+    def _get_int(raw: bytes, off: int, size: int, signed: bool = False) -> Optional[int]:
+        """从 raw 的 off 处取 size 字节小端整数；越界返回 None。"""
+        if off + size > len(raw):
+            return None
+        return int.from_bytes(raw[off:off+size], 'little', signed=signed)
+
+    @classmethod
+    def parse_tactile(cls, raw: bytes, info: Dict) -> Dict:
+        """按缓存的字段布局解析一帧触觉原始数据（纯计算，不发帧）。
+
+        返回::
+
+            {"fields": {标签: 值或值列表, ...},      # 分布描述里的全部字段
+             "force":  {"法向力合力": v, "切向力合力": v, "切向力合力方向": v},
+             "cells":  [点阵值...],                  # 一维，按分布描述顺序
+             "matrix": [[...], ...]}                 # 行优先二维（行列取自元信息）
+
+        分布描述缺失时退化为「整段都是点阵」，force 为空字典。
+        """
+        fields: Dict[str, object] = {}
+        force: Dict[str, int] = {}
+        for f in info.get("layout") or ():
+            if f["count"] == 1:
+                v = cls._get_int(raw, f["offset"], f["elem_size"], f["signed"])
+                fields[f["tag"]] = v
+                if f["tag"] in SENSOR_FORCE_TAGS and v is not None:
+                    force[f["name"]] = v
+            else:
+                vals = [cls._get_int(raw, f["offset"] + i * f["elem_size"],
+                                     f["elem_size"], f["signed"]) or 0
+                        for i in range(f["count"])]
+                fields[f["tag"]] = vals
+        # 点阵：优先用布局里的点阵字段，否则整段当点阵
+        rows, cols = info.get("rows", 0), info.get("cols", 0)
+        mat_field = info.get("matrix_field")
+        if mat_field is not None:
+            cells = list(fields.get(mat_field["tag"]) or ())
+        else:
+            bpc = info.get("bytes_per_cell", 1)
+            n = info.get("matrix_count") or (rows * cols)
+            off0 = info.get("matrix_offset", 0)
+            cells = [cls._get_int(raw, off0 + i * bpc, bpc) or 0 for i in range(n)]
+        matrix = None
+        if rows and cols:
+            padded = cells + [0] * max(0, rows * cols - len(cells))
+            matrix = [padded[r*cols:(r+1)*cols] for r in range(rows)]
+        return {"fields": fields, "force": force, "cells": cells, "matrix": matrix}
+
+    def read_tactile(self, finger: Optional[int] = None) -> Optional[Dict]:
+        """读一帧并完整解析（合力 + 点阵 + 全部字段）——高频推荐入口。
+        一次数据读取拿到全部信息，比分别调 get_tactile_force / read_tactile_matrix
+        省一半总线流量。"""
+        raw = self.read_tactile_raw(finger)
         if raw is None:
             return None
-        cells = rows * cols
-        bpc = 2 if cells and (total // cells) >= 2 else 1
-        vals = []
-        for i in range(cells):
-            if bpc == 2 and (i * 2 + 2) <= len(raw):
-                vals.append(int.from_bytes(raw[i*2:i*2+2], 'little'))
-            elif bpc == 1 and i < len(raw):
-                vals.append(raw[i])
-            else:
-                vals.append(0)
-        return [vals[r*cols:(r+1)*cols] for r in range(rows)]
+        target = finger if finger is not None else self._selected_sensor
+        info = self.sensors.get(target)
+        if info is None:
+            return None
+        out = self.parse_tactile(raw, info)
+        out["finger"] = target
+        out["name"] = info["name"]
+        out["unit"] = info.get("unit", "")
+        out["raw"] = raw
+        return out
+
+    def get_tactile_force(self, finger: Optional[int] = None) -> Optional[Dict[str, int]]:
+        """读取合力值：{法向力合力, 切向力合力, 切向力合力方向}（原始计数值）。
+
+        合力不是独立寄存器——它由「数据分布描述」(0x2B) 声明在数据区开头
+        （示例 ``FnS_U16_1;FtS_U16_1;FdS_U16_1;Rsv_U16_1;Fn_U8_40``），
+        与点阵一次读回。若该传感器的分布描述里没有合力字段则返回空字典。
+        ⚠️ 协议只给了「数据单位」(0x20) 和「量程」(0x28)，未给原始值→物理量的
+           换算公式，要 N/g 需实测标定。
+        """
+        raw = self.read_tactile_raw(finger)
+        if raw is None:
+            return None
+        target = finger if finger is not None else self._selected_sensor
+        info = self.sensors.get(target)
+        if info is None:
+            return None
+        return self.parse_tactile(raw, info)["force"]
+
+    def get_all_tactile_force(self) -> Dict[int, Dict[str, int]]:
+        """依次读取全部已缓存传感器的合力值，返回 {finger: {字段名: 值}}。"""
+        out: Dict[int, Dict[str, int]] = {}
+        for finger in self.sensors:
+            f = self.get_tactile_force(finger)
+            if f:
+                out[finger] = f
+        return out
+
+    def get_tactile_summary(self, finger: Optional[int] = None) -> Optional[Dict]:
+        """一次读取给出抓取判定常用量：设备上报的合力 + 点阵统计。
+
+        返回 {finger, name, force(设备合力), cell_sum(点阵求和), cell_max,
+        contact(非零点数), centroid(质心 row,col 或 None)}。
+        cell_sum 是上位机对点阵求和的「合力近似」，与设备上报的 force 可互相校核。
+        """
+        frame = self.read_tactile(finger)
+        if frame is None:
+            return None
+        cells = frame["cells"]
+        info = self.sensors.get(frame["finger"]) or {}
+        cols = info.get("cols", 0)
+        total = sum(cells)
+        contact = sum(1 for v in cells if v)
+        centroid = None
+        if total and cols:
+            sr = sum((i // cols) * v for i, v in enumerate(cells))
+            sc = sum((i % cols) * v for i, v in enumerate(cells))
+            centroid = (round(sr / total, 2), round(sc / total, 2))
+        return {
+            "finger":   frame["finger"],
+            "name":     frame["name"],
+            "force":    frame["force"],
+            "cell_sum": total,
+            "cell_max": max(cells) if cells else 0,
+            "contact":  contact,
+            "centroid": centroid,
+        }
+
+    def read_tactile_matrix(self, finger: int) -> Optional[List[List[int]]]:
+        """读取触觉并按行优先还原为二维点阵矩阵（布局/行列取自初始化缓存）。
+
+        点阵起始偏移与每格字节数由「数据分布描述」给出——数据区开头的合力等
+        标量会被跳过（旧实现把它们当成前几个点阵值，是错的）。描述缺失时退化为
+        「整段都是点阵、每格 = 总长÷(行×列)」。
+        ⚠️ 该还原假设设备处于「填充无效数据补矩形」模式(SI 0x72 默认 1)；若关闭
+           该模式，数据区是一维有效数据，需按 dist_desc 自行映射。
+        """
+        info = self.sensors.get(finger) or self.get_sensor_info(finger, refresh=True)
+        if not info:
+            return None
+        if not info["rows"] or not info["cols"]:
+            return None
+        raw = self.read_tactile_raw(finger)
+        if raw is None:
+            return None
+        return self.parse_tactile(raw, info)["matrix"]
+
+    def read_all_tactile_raw(self) -> Dict[int, bytes]:
+        """依次读取全部已缓存传感器的原始数据，返回 {finger: bytes}（读失败者不收录）。"""
+        out: Dict[int, bytes] = {}
+        for finger in self.sensors:
+            raw = self.read_tactile_raw(finger)
+            if raw is not None:
+                out[finger] = raw
+        return out
+
+    def read_all_tactile_matrix(self) -> Dict[int, List[List[int]]]:
+        """依次读取全部已缓存传感器并还原为矩阵，返回 {finger: 矩阵}。"""
+        out: Dict[int, List[List[int]]] = {}
+        for finger in self.sensors:
+            m = self.read_tactile_matrix(finger)
+            if m is not None:
+                out[finger] = m
+        return out
+
+    def get_tactile_data(self, finger: Optional[int] = None) -> Optional[Dict]:
+        """**一次读取**同时返回点阵矩阵与合力值，字典 key 全为英文（协议标签）。
+
+        合力与点阵本来就在同一个数据区里（合力在开头、点阵在其后），所以这里只发
+        一次数据读——比分别调 read_tactile_matrix() + get_tactile_force() 省一半
+        总线流量，高频循环用这个。返回::
+
+            {"finger":   1,                    # 传感器编号(1拇指~5小指,6手掌)
+             "name":     "大拇指",
+             "rows":     10, "cols": 7,        # 点阵行列（元信息缓存）
+             "unit":     "N",                  # 设备自报数据单位
+             "force":    {"FnS": 123, "FtS": 45, "FdS": 90},
+             "matrix":   [[...], ...],         # 行优先二维点阵
+             "cells":    [...],                # 一维点阵（按分布描述顺序）
+             "cell_sum": 0, "cell_max": 0}     # 点阵求和/最大值（上位机算的）
+
+        force 的 key 直接用协议「数据分布描述」里的标签：
+          ``FnS`` 法向力合力、``FtS`` 切向力合力、``FdS`` 切向力合力方向。
+        **描述里没有声明的合力字段不会出现**（如实机 ``Fn_U8_70`` 只有点阵，
+        force 即为空字典）——不臆造设备没上报的量，这种情况用 cell_sum 近似。
+        读失败 / 传感器不可用时返回 None。
+        """
+        frame = self.read_tactile(finger)
+        if frame is None:
+            return None
+        info = self.sensors.get(frame["finger"]) or {}
+        cells = frame["cells"]
+        fields = frame["fields"]
+        return {
+            "finger":   frame["finger"],
+            "name":     frame["name"],
+            "rows":     info.get("rows", 0),
+            "cols":     info.get("cols", 0),
+            "unit":     frame.get("unit", ""),
+            "force":    {tag: fields[tag] for tag in SENSOR_FORCE_TAGS
+                         if isinstance(fields.get(tag), int)},
+            "matrix":   frame["matrix"],
+            "cells":    cells,
+            "cell_sum": sum(cells),
+            "cell_max": max(cells) if cells else 0,
+        }
+
+    def get_all_tactile_data(self) -> Dict[int, Dict]:
+        """依次读取全部可用传感器的「矩阵 + 合力」，返回 {finger: get_tactile_data(...)}。
+        每个传感器只发「选择 + 数据」两步，读失败者不收录。"""
+        out: Dict[int, Dict] = {}
+        for finger in self.sensors:
+            d = self.get_tactile_data(finger)
+            if d is not None:
+                out[finger] = d
+        return out
+
+    # ---- 传感器数据区形态设置（MI 0x31 可写项） ---- #
+    def set_sensor_pad_rect(self, enable: bool) -> bool:
+        """设置是否填充无效数据把传感器外轮廓补成矩形（SI 0x72，默认 1=补齐）。
+        关闭后数据区变为一维有效数据，总长度会变——本方法会刷新对应缓存。"""
+        if not self._write(MI.SENSOR_CMD, SensorSI.PAD_RECT,
+                           bytes([1 if enable else 0])):
+            return False
+        if self._selected_sensor is not None:
+            self.get_sensor_info(self._selected_sensor, refresh=True)
+        return True
+
+    def set_sensor_flag_mode(self, enable: bool) -> bool:
+        """切换「传感器有效数据标识模式」（SI 0x71，默认 0）。
+        置 1 后数据区固定为 有效=1 / 无效=0，用于查看补零后的位置关系。
+        ⚠️ 实测部分固件该项无效（写入被忽略），数据区仍为真实读数。"""
+        return self._write(MI.SENSOR_CMD, SensorSI.FLAG_MODE,
+                           bytes([1 if enable else 0]))
+
+    def set_sensor_data_shape(self, rows: int, cols: int) -> bool:
+        """设置数据行/列（SI 0x6F / 0x70，可写）。改动后刷新对应缓存。
+        注意刷新时不会再把最大行/列写回，以保留这里设置的形态。"""
+        ok = self._write(MI.SENSOR_CMD, SensorSI.DATA_ROWS, bytes([rows & 0xFF]))
+        ok = self._write(MI.SENSOR_CMD, SensorSI.DATA_COLS, bytes([cols & 0xFF])) and ok
+        if ok and self._selected_sensor is not None:
+            self.get_sensor_info(self._selected_sensor, refresh=True, apply_shape=False)
+        return ok
+
+    def print_sensors(self):
+        """打印初始化探测结论：可用传感器的元信息/字段布局 + 不可用清单（不发帧）。"""
+        print("=" * 50)
+        if not self._sensor_probed:
+            print("ℹ️ 尚未探测传感器（probe_sensor=False，可手动调 probe_sensors()）")
+        if not self.sensors:
+            print("ℹ️ 无可用传感器")
+        else:
+            print(f"可用传感器 {len(self.sensors)} 个 {self.available_sensors}"
+                  f"（五指={'有' if self.has_finger_sensors else '无'}, "
+                  f"手掌={'有' if self.has_palm_sensor else '无'}）:")
+        for finger, v in self.sensors.items():
+            print(f"  [{finger}] {v['name']:6s} 类型={v['type'] or '-':16s} "
+                  f"总长={v['total_length']:4d}B 行列={v['rows']}x{v['cols']} "
+                  f"每格={v['bytes_per_cell']}B 单位={v['unit'] or '-'} "
+                  f"量程={v['range']} 帧数={len(v['plan'])}")
+            if v["dist_desc"]:
+                print(f"        分布描述: {v['dist_desc']}")
+            for f in v.get("layout") or ():
+                print(f"          偏移 {f['offset']:3d} +{f['size']:3d}B  "
+                      f"{f['type']}×{f['count']:<3d} {f['name']}")
+            if not v.get("force_fields"):
+                print("        ⚠️ 该传感器分布描述中无合力字段，合力需自行对点阵求和")
+        if self.sensor_unavailable:
+            print(f"不可用传感器 {len(self.sensor_unavailable)} 个（读取会被本地直接拒绝）:")
+            for finger, reason in sorted(self.sensor_unavailable.items()):
+                name = SENSOR_FINGER_NAMES.get(finger, f"传感器{finger}")
+                print(f"  [{finger}] {name:6s} {reason}")
+        print("=" * 50)
 
     # ================================================================== #
     # 预设动作 / 手势（MI 0x36~0x3A，各 7 字节）
@@ -1377,14 +2410,15 @@ class LinkerHandO30Controller:
                 return "RIGHT"
         return self._read_string(ProductInfoSI.HAND_SIDE)
 
-    def dump_product_info(self, total: int = 0xF0, chunk: int = 48):
+    def dump_product_info(self, total: int = 0xF9, chunk: int = 48):
         """逐段读产品信息(MI 0x41)并按 偏移/ASCII 打印，用于核对真实字段偏移。
+        默认覆盖到 0xF9（最后一个字段：左右手 0xF1+8）。
         换固件或字段错位时跑这个，对照打印结果调整 ProductInfoSI 偏移即可。"""
         print("=" * 60)
         print("产品信息原始转储 (偏移: ASCII)：")
         off = 0
         while off < total and off <= 0xFF:
-            n = min(chunk, total - off, 0x100 - off)
+            n = min(chunk, total - off, 0x100 - off, MAX_LD)
             body = self._request(MI.PRODUCT_INFO, off, n)
             if not body:
                 print(f"  0x{off:02X}: <读取失败/超时>")
@@ -1395,24 +2429,32 @@ class LinkerHandO30Controller:
         print("=" * 60)
 
     def get_device_info(self) -> Dict[str, Optional[str]]:
-        """读取一组常用产品信息字段（上电优先识别）"""
+        """读取一组常用产品信息字段（上电优先识别，偏移见 ProductInfoSI/xlsx v0.0.4）"""
         fields = {
             "产品型号":     ProductInfoSI.MODEL,
             "供电电压范围": ProductInfoSI.VOLTAGE_RANGE,
             "设备唯一标识": ProductInfoSI.DEVICE_UID,
             "协议名称":     ProductInfoSI.PROTOCOL_NAME,
             "协议版本":     ProductInfoSI.PROTOCOL_VERSION,
+            "接口板版本":   ProductInfoSI.HW_VER_INTERFACE,
+            "转接板版本":   ProductInfoSI.HW_VER_ADAPTER,
             "控制板版本":   ProductInfoSI.HW_VER_CONTROL,
-            #"app版本":     ProductInfoSI.APP_VERSION,
+            "app版本":      ProductInfoSI.APP_VERSION,
+            "机械结构版本": ProductInfoSI.MECH_VERSION,
             "编译时间":     ProductInfoSI.BUILD_TIME,
             "支持协议":     ProductInfoSI.SUPPORTED_PROTO,
-            "左右手":       ProductInfoSI.HAND_SIDE,
         }
         info: Dict[str, Optional[str]] = {
             name: self._read_string(si_len) for name, si_len in fields.items()
         }
-        # 传感器类型不在产品信息(0x41)，走工程服务(0x42/0x4A)单独读
-        info["传感器类型"] = self.get_sensor_type()
+        # 左右手优先用工程服务枚举(0x42/0x49)，不依赖产品信息字段偏移
+        info["左右手"] = self.get_hand_side()
+        # 传感器：类型/长度直接取初始化缓存，不再发帧
+        if self.sensors:
+            info["传感器类型"] = "、".join(
+                f"{v['name']}:{v['type'] or '-'}" for v in self.sensors.values())
+        else:
+            info["传感器类型"] = self.get_sensor_type()
         self.hand_info = info  # 缓存，供外部访问
         return info
 
@@ -1500,6 +2542,8 @@ class LinkerHandO30Controller:
 # 示例
 # ============================================================================
 if __name__ == "__main__":
+    # initialize(probe_sensor=True) 时会在上电阶段一次性探测并缓存各传感器的
+    # 数据总长度/行列/分段读取计划；之后 read_tactile_raw() 只发数据帧。
     with LinkerHandO30Controller(hand_type="right") as hand:
         if hand.initialize():
             # 上电识别
@@ -1515,3 +2559,36 @@ if __name__ == "__main__":
             time.sleep(2)
             hand.open_palm(wait=True)       # 张开（伸直）
             hand.print_joint_positions()
+
+            # ---- 传感器：初始化已判定可用性并缓存元信息 ---- #
+            hand.print_sensors()                       # 可用/不可用清单 + 字段布局
+            print("可用传感器:", hand.get_available_sensors())      # 例 [1,2,3,4,5]
+            print("不可用   :", hand.get_unavailable_sensors())     # 例 {6:'未安装'}
+            print("有手掌传感器:", hand.has_palm_sensor)
+            # 不可用编号会被本地直接拒绝，不发帧、不等超时
+            if not hand.is_sensor_available(SensorFinger.PALM):
+                print("跳过手掌传感器读取")
+            for finger in hand.available_sensors:
+                s = hand.get_tactile_summary(finger)
+                print(f"  {hand.sensor_names[finger]}: 合力={s['force']} "
+                      f"点阵和={s['cell_sum']} 峰值={s['cell_max']} "
+                      f"触点={s['contact']} 质心={s['centroid']}")
+            if hand.available_sensors:
+                finger = hand.available_sensors[0]
+                print(f"缓存长度: {hand.get_sensor_length(finger)} 字节")  # 不发帧
+                t0 = time.time()
+                loops = 20
+                for _ in range(loops):                 # 同一传感器连读：选择帧只发 1 次
+                    frame = hand.read_tactile(finger)  # 一次读取 → 合力 + 点阵
+                dt = (time.time() - t0) / loops
+                print(f"read_tactile 平均 {dt*1000:.1f} ms/次")
+                if frame:
+                    # 合力值（法向力合力/切向力合力/方向）来自数据区开头，无需额外帧
+                    print("合力:", frame["force"])
+                    for row in frame["matrix"] or []:
+                        print("  " + " ".join(f"{v:4d}" for v in row))
+                print("全部合力:", hand.get_all_tactile_force())
+
+            # ---- 故障与错误码诊断 ---- #
+            hand.print_joint_faults()      # MI 0x0C 关节故障位
+            hand.print_error_history()     # MI 0x4F 最新槽号 + 15 条历史

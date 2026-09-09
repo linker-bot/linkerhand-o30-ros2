@@ -2,10 +2,10 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>linker_hand_o30_ros2_sdk</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <version>3.0.1</version>
+  <description>LinkerHand O30 二十自由度灵巧手 ROS 2 驱动（CANFD / HOP 协议）</description>
   <maintainer email="linkerhand@todo.todo">linkerhand</maintainer>
-  <license>TODO: License declaration</license>
+  <license>Apache-2.0</license>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

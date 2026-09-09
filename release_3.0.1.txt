@@ -1,0 +1,13 @@
+**V3.0.1**
+
+1. 支持 O30 版 Linker Hand ROS2 驱动（HOP 协议 v0.0.2 ~ v0.0.4 已验证）。
+2. 支持 `libcanbus`（金属 CANFD 盒）与 `socketcan`（透明塑封 USB-CANFD）两种通信后端。
+3. 上电安全链路：产品型号 / 左右手 / 协议核对 + 关节故障检查通过后才允许运动；不通过则打印原因后退出，
+   不建话题、不起控制线程（`strict_device_check`、`ignore_joint_faults`、`auto_init_pose`）。
+4. 控制输入全量校验：长度（20 或 1 广播）、`NaN`/`Inf` 拒绝、`joint_limit_min/max` 截断。
+5. deadman 命令流看门狗：`hold` / `open` / `disable` 三种失联处置。
+6. 双手隔离：设置命令按 `params.hand_type` 分派，并新增单手话题 `/cb_<hand>_hand_setting_cmd`。
+7. 诊断话题 `/cb_<hand>_hand_info`：温度、电流、关节故障、通信错误码、在线状态、deadman 状态、实测频率。
+8. 触觉发布优化到 30 Hz：独立线程 + 单次读取同时取点阵与合力 + `touch_fingers` / `touch_publish_matrix` 裁剪。
+9. GUI 控制界面：20 关节滑块、预设手势（握拳 / 张开 / 数字手势 壹~捌 / 赞）、循环预设动作、速度与力矩设置。
+10. 新增无硬件打桩自检脚本 `test/node_safety_check.py`。

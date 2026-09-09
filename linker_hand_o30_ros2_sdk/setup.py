@@ -10,7 +10,7 @@ package_name = 'linker_hand_o30_ros2_sdk'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='3.0.1',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -22,8 +22,8 @@ setup(
     zip_safe=False,
     maintainer='linkerhand',
     maintainer_email='linkerhand@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='LinkerHand O30 二十自由度灵巧手 ROS 2 驱动（CANFD / HOP 协议）',
+    license='Apache-2.0',
     extras_require={
         'test': [
             'pytest',
