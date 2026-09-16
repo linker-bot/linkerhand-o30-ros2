@@ -14,8 +14,9 @@ def generate_launch_description():
                 'hand_type': 'right', # 配置Linker Hand灵巧手类型 left | right 字母为小写
                 'hand_joint': "O30", # O30 字母为大写
                 'is_touch': True, # 配置Linker Hand灵巧手是否有压力传感器 True | False
+                'is_rad': False,  # 是否开启弧度state发布
                 'canfd_device': 0, #蓝色 or 黑色CANFD盒 配置CANFD设备编号 0 | 1 先插入的设备为0，后插入的设备为1。单CANFD设置为0即可
-                'comm_type': 'libcanbus', # libcanbus | socketcan 蓝色 or 黑色CANFD盒设置为:libcanbus。透明塑封 USB-CANFD 设备设置为:socketcan 通信后端 libcanbus(厂商私有库) | socketcan(内核原生 can0 + python-can, 透明塑封 USB-CANFD 设备)
+                'comm_type': 'libcanbus', # libcanbus | socketcan。 蓝色 or 黑色CANFD盒设置为:libcanbus。透明塑封 USB-CANFD 设备设置为:socketcan 通信后端 libcanbus(厂商私有库) | socketcan(内核原生 can0 + python-can, 透明塑封 USB-CANFD 设备)
                 # 以下四项仅 comm_type='socketcan' 时生效：
                 'channel': 'can0',   # 透明塑封 USB-CANFD 设备 socketcan 接口名
                 'bitrate': 1000000,  # 仲裁段波特率 (须与灵巧手一致)

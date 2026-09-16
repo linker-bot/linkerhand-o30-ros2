@@ -44,6 +44,7 @@ from wcwidth import wcswidth
 from .core.canfd.linker_hand_o30_control import (
     LinkerHandO30Controller, NAMES_EN, NAMES_CN)
 from .utils.color_msg import ColorMsg
+from .utils.mapping import *
 
 # 上电初始姿态（20 个有效关节，顺序见 README 第 4 节），可用 init_pose 参数覆盖
 INIT_POSE = [33, 23, 96, 176, 212, 162, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
@@ -105,6 +106,7 @@ class LinkerHand(Node):
         self.declare_parameter('hand_type', 'left')
         self.declare_parameter('hand_joint', 'O30')
         self.declare_parameter('is_touch', False)
+        self.declare_parameter('is_rad', False)
         self.declare_parameter('canfd_device', 0)
         # 通信后端：'libcanbus'(默认, 厂商私有库) 或 'socketcan'(内核原生 can0 + python-can,
         # 用于透明塑封 USB-CANFD 设备)。后四个参数仅 socketcan 生效。
@@ -157,6 +159,7 @@ class LinkerHand(Node):
         self.hand_type = str(self.get_parameter('hand_type').value).lower()
         self.hand_joint = self.get_parameter('hand_joint').value
         self.is_touch = bool(self.get_parameter('is_touch').value)
+        self.is_rad = bool(self.get_parameter('is_rad').value)
         self.canfd_device = self.get_parameter('canfd_device').value
         self.comm_type = self.get_parameter('comm_type').value
         self.channel = self.get_parameter('channel').value
@@ -406,6 +409,8 @@ class LinkerHand(Node):
         # joint state状态发布
         self.hand_state_pub = self.create_publisher(
             JointState, f'/cb_{self.hand_type}_hand_state', 10)
+        if self.is_rad == True:
+            self.hand_state_rad_pub = self.create_publisher(JointState, f'/cb_{self.hand_type}_hand_state_rad', 10)
         # 判断是否存在触觉数据，如果存在则创建触觉数据发布器
         if self.is_touch:
             self.matrix_touch_pub = self.create_publisher(
@@ -646,7 +651,14 @@ class LinkerHand(Node):
         effort = self.linker_hand.get_motor_current() if self.publish_effort else None
         self.hand_state_pub.publish(self.joint_state_msg(pose, vel=vel, effort=effort))
         self._tick("state")
-
+        if self.is_rad == True:
+            if self.hand_type == "left":
+                rad_pose = range_to_rad_left(pose, self.hand_joint)
+            else:
+                rad_pose = range_to_rad_right(pose, self.hand_joint)
+            self.hand_state_rad_pub.publish(self.joint_state_msg(rad_pose, vel=vel, effort=effort))
+            self._tick("state_rad")
+            
     def joint_state_msg(self, pose, vel=None, effort=None):
         joint_state = JointState()
         joint_state.header = Header()
