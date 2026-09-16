@@ -27,7 +27,7 @@ O30 为 **20 自由度** 灵巧手，采用 **HOP (Hand Object Protocol)** CANFD
 
 ## 1.1 主要特性
 
-* **两种通信后端**：`libcanbus`（厂商私有库，金属 CANFD 盒）与 `socketcan`（内核原生 `can0` + python-can）。
+* **两种通信后端**：`libcanbus`（厂商私有库，金属 CANFD 盒）与 `socketcan`（内核原生 `can0` + python-can, 带有WIN|Linux开关）。
 * **单字节关节接口**：20 个有效关节，位置 / 速度 / 力矩均为 `0 ~ 255`，话题为标准 `sensor_msgs/JointState`。
 * **上电安全校验**：核对产品型号、左右手、协议名称与关节故障，任一致命项不通过则**不发出任何运动指令**。
 * **输入校验与限位**：空列表 / `NaN` / `Inf` / 越界全部在下发前拦住，异常命令被丢弃或截断而不会变成错误动作。
@@ -65,7 +65,7 @@ O30 为 **20 自由度** 灵巧手，采用 **HOP (Hand Object Protocol)** CANFD
 **V3.0.1**
 
 1. 支持 O30 版 Linker Hand ROS2 驱动（HOP 协议 v0.0.2 ~ v0.0.4 已验证）。
-2. 支持 `libcanbus`（金属 CANFD 盒）与 `socketcan`（透明塑封 USB-CANFD）两种通信后端。
+2. 支持 `libcanbus`（金属 CANFD 盒）与 `socketcan`（透明塑封 USB-CANFD，带有WIN|Linux开关）两种通信后端。
 3. 上电安全链路：产品型号 / 左右手 / 协议核对 + 关节故障检查通过后才允许运动；不通过则打印原因后退出，
    不建话题、不起控制线程（`strict_device_check`、`ignore_joint_faults`、`auto_init_pose`）。
 4. 控制输入全量校验：长度（20 或 1 广播）、`NaN`/`Inf` 拒绝、`joint_limit_min/max` 截断。
@@ -146,7 +146,7 @@ O30 支持以下两类 CANFD 设备，对应不同的通信后端 `comm_type`：
 将对应架构的 `libcanbus` 库解压到 `/usr/local/lib/` 目录下：
 
 ```bash
-$ tar -xvf "libcanbus(ubuntu22).tar" -C /usr/local/lib/
+$ tar -xvf "libcanbus(ubuntu22).tar" -C /usr/local/lib/ # Ubuntu24同样适用
 ```
 
 配置环境变量：
@@ -169,7 +169,12 @@ $ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 * 编译提示 `pthread` 相关错误，说明自带 libusb 库不匹配：`sudo apt-get install libusb-1.0-0-dev`，并删除 `/usr/local/lib` 下的 libusb 相关文件。
 * 提示 `ludev` 错误：`sudo apt-get install libudev-dev`。
 * 找不到 `cc1plus`：`sudo apt-get install --reinstall build-essential`。
-
+如不了解编译，按照如下操作执行
+```bash
+$ sudo apt-get install libusb-1.0-0-dev
+$ sudo apt-get install libudev-dev
+$ sudo apt-get install --reinstall build-essential
+```
 设备权限：root 用户可直接读写 usbcan 设备。非 root 用户需修改 usbcan 模块操作权限，可将 `99-canfd.rules` 放到 `/etc/udev/rules.d/`，然后执行：
 
 ```bash
@@ -179,10 +184,10 @@ $ sudo udevadm trigger
 
 重启系统生效。（同总线双手可参考 `99-double-canfd.rules`。）
 
-## 5.3 透明塑封 USB-CANFD 设备配置 (comm_type = socketcan)
-
-1. 确保 type-c 接口下方的开关拨到 **Linux 模式**（若 `lsusb` 显示为 `STM32 Virtual ComPort`，说明仍是串口模式）。
-2. 重新插拔 USB，确认接口枚举为原生 CAN：
+## 5.3 透明塑封 USB-CANFD 带有WIN|Linux开关 设备配置 (comm_type = socketcan)
+1. 确保开关在Linux端
+2. 确保 type-c 接口下方的开关拨到 **Linux 模式**（若 `lsusb` 显示为 `STM32 Virtual ComPort`，说明仍是串口模式）。
+3. 重新插拔 USB，确认接口枚举为原生 CAN：
 
 ```bash
 $ ip -br link show type can
