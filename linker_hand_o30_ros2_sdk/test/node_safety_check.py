@@ -45,6 +45,8 @@ class FakeCtrl:
         self.hb = 0
         self.side = "RIGHT"
         self.faults = {}
+        # 传感器元信息（节点 init_hand 会读 sensors[<first avail>]["type"] 判点阵/标量）
+        self.sensors = {1: {"type": "HUAWEIKE"}, 2: {"type": "HUAWEIKE"}}
 
     # --- 信息 ---
     def get_device_info(self):

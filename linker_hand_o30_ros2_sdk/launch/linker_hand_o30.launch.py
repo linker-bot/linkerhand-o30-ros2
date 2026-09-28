@@ -11,12 +11,12 @@ def generate_launch_description():
             name='linker_hand_o30_ros2_sdk',
             output='screen',
             parameters=[{
-                'hand_type': 'right', # 配置Linker Hand灵巧手类型 left | right 字母为小写
+                'hand_type': 'left', # 配置Linker Hand灵巧手类型 left | right 字母为小写
                 'hand_joint': "O30", # O30 字母为大写
                 'is_touch': True, # 配置Linker Hand灵巧手是否有压力传感器 True | False
                 'is_rad': False,  # 是否开启弧度state发布
                 'canfd_device': 0, #蓝色 or 黑色CANFD盒 配置CANFD设备编号 0 | 1 先插入的设备为0，后插入的设备为1。单CANFD设置为0即可
-                'comm_type': 'libcanbus', # libcanbus | socketcan。 蓝色 or 黑色CANFD盒设置为:libcanbus。透明塑封 USB-CANFD 设备设置为:socketcan 通信后端 libcanbus(厂商私有库) | socketcan(内核原生 can0 + python-can, 透明塑封 USB-CANFD 设备)
+                'comm_type': 'socketcan', # libcanbus | socketcan。 蓝色 or 黑色CANFD盒设置为:libcanbus。透明塑封 USB-CANFD 设备设置为:socketcan 通信后端 libcanbus(厂商私有库) | socketcan(内核原生 can0 + python-can, 透明塑封 USB-CANFD 设备)
                 # 以下四项仅 comm_type='socketcan' 时生效：
                 'channel': 'can0',   # 透明塑封 USB-CANFD 设备 socketcan 接口名
                 'bitrate': 1000000,  # 仲裁段波特率 (须与灵巧手一致)
@@ -34,8 +34,8 @@ def generate_launch_description():
                 'cmd_timeout': 0.0,       # 秒；<=0 关闭。上层失联超过该时间即执行 deadman_action
                 'deadman_action': 'hold', # hold(保持) | open(伸直五指) | disable(失能)
                 # ---- 频率与诊断 ----
-                'state_rate': 30.0,       # 状态发布/命令下发频率 Hz
-                'touch_rate': 30.0,       # 触觉发布频率 Hz（独立线程；实测值见 info 的 touch_hz）
+                'state_rate': 35.0,       # 状态发布/命令下发频率 Hz
+                'touch_rate': 31.0,       # 触觉发布频率 Hz（独立线程；实测值见 info 的 touch_hz）
                 'touch_fingers': [1, 2, 3, 4, 5], # 要读的传感器 1拇指~5小指(6手掌本机无)；少读几指才能上高频
                 'touch_publish_matrix': True,     # False 时只发合力话题，省一半 JSON 序列化
                 'info_rate': 1.0,         # 诊断信息发布频率 Hz

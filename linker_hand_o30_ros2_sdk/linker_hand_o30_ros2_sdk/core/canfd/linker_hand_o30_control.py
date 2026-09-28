@@ -263,6 +263,26 @@ class EngineeringSI:
     UPDATE_MOTOR_FW = 0xCC   # uint8      [不支持] 写 1 切换到更新电机固件模式
     PROTOCOL_SWITCH = 0xCD   # uint8      接口协议切换（新旧协议过渡期用）
 
+ENGINEERING_PASSWORD = "123456"   # 工程服务默认密码(str8, EngineeringSI.PASSWORD)
+class DebugBSI:
+    """调试功能B 子索引 (MI=0x44) —— 关节行程微调校准偏置，按 xlsx「相关主索引 0x44」。
+
+    对象是两段各 36 字节的 **int8** 向量，子索引空间与 JOINT_MAP / 有效关节(0x0D)
+    完全同构：块内偏移 == 关节物理子索引 si（横滚仅拇指、指根2 无拇指等空洞位同样
+    保留，硬件忽略）。两段：
+        START 起点偏置 SI 0x00~0x23  —— 关节行程「起点」位置微调校准偏置，支持掉电保存
+        END   终点偏置 SI 0x24~0x47  —— 关节行程「终点」位置微调校准偏置
+    单值范围按表 -127~128（实际按 int8 补码存储，写入前裁剪到 [-128,127]）。
+    ⚠️ xlsx「是否支持该功能」标「否」，但实测固件已支持；「写入是否需要密码」标「是」，
+       故写偏置前须先写工程服务密码(MI 0x42 SI 0x00, 见 ENGINEERING_PASSWORD)，
+       否则设备回 0x10 权限不足。改完须 save_to_flash() 才掉电保留(仅起点段支持保存)。
+    """
+    START_BASE = 0x00   # 行程起点偏置基址（36 槽，块内偏移 == 关节 si）
+    END_BASE   = 0x24   # 行程终点偏置基址（36 槽，块内偏移 == 关节 si）
+    COUNT      = 0x24   # 每段 36 个逻辑关节槽
+
+
+I8_MIN, I8_MAX = -128, 127   # int8 可存储范围（DebugBSI 偏置按此裁剪）
 
 class CtrlMode:
     """控制模式 (ConfigSI.CTRL_MODE 取值)，默认 0x01。
@@ -382,12 +402,19 @@ SENSOR_FIELD_NAMES = {
     "Fn":  "法向力点阵",
     "Ft":  "切向力点阵",
     "Fd":  "方向点阵",
+    "Px":  "接近值",
     "Rsv": "保留",
 }
 # 合力类标量字段（个数为 1，位于数据区头部）
 SENSOR_FORCE_TAGS = ("FnS", "FtS", "FdS")
 # 点阵类字段标签（个数 = 行×列）
 SENSOR_MATRIX_TAGS = ("Fn", "Ft", "Fd")
+# 新传感器(TASHAN_GATHER)的标量力字段直接用 Fn/Ft/Fd 表示(个数=1)，如
+# Fn_F32_1;Ft_F32_1;Fd_U16_1;Px_U32_1 = float法向力合力 + float切向力 +
+# uint16切向力方向 + uint32接近值(Px)。兼容规则：标签在 合力∪点阵 族且
+# 个数==1 即为标量力；个数>1 才是点阵。旧格式 FnS/FtS/FdS(个1) 与
+# Fn/Ft/Fd(个>1,点阵) 的判定保持不变，仅新增对 #Fn/Ft/Fd 标量力的支持。
+SENSOR_SCALAR_FORCE_TAGS = tuple(dict.fromkeys(SENSOR_FORCE_TAGS + SENSOR_MATRIX_TAGS))
 
 
 class SensorType:
@@ -1149,6 +1176,22 @@ class LinkerHandO30Controller:
     def _unpack_u8(self, body: bytes) -> List[int]:
         return [body[si] if si < len(body) else 0 for _, si in self.active_joints]
 
+    def _pack_i8(self, values: List[int]) -> bytes:
+        """int8 向量打包（按有效关节 si 落位，值裁剪到 [-128,127] 取补码，空洞位=0）。
+        用于 DebugBSI 行程偏置等有符号单字节向量。"""
+        buf = bytearray(self.phys_span)
+        for (_, si), v in zip(self.active_joints, values):
+            buf[si] = max(I8_MIN, min(I8_MAX, int(v))) & 0xFF
+        return bytes(buf)
+
+    def _unpack_i8(self, body: bytes) -> List[int]:
+        """int8 向量解包（按有效关节 si 取字节并作有符号补码解释）。"""
+        out = []
+        for _, si in self.active_joints:
+            b = body[si] if si < len(body) else 0
+            out.append(b - 256 if b >= 128 else b)
+        return out
+
     # ================================================================== #
     # 关节使能 / 故障（上电流程必需）
     # ⚠️ 按 xlsx「协议格式」修正主索引：0x0C=关节故障(JointFault)，
@@ -1575,6 +1618,82 @@ class LinkerHandO30Controller:
             print(f"  [{i:2d}] 0x{code:02X}  {'、'.join(self.decode_error_code(code))}{mark}")
         print("=" * 50)
 
+    def enter_engineering_password(self, password: str = ENGINEERING_PASSWORD) -> bool:
+        """写工程服务密码解锁受保护寄存器（MI 0x42 SI 0x00, str8）。
+        写 DebugBSI 行程偏置 / ConfigSI.RESTORE_ALL 等「写入需要密码」的项前调用，
+        否则设备回 0x10 权限不足。密码仅当次会话有效，掉电或重连后需重新写入。"""
+        return self._write(MI.ENGINEERING, EngineeringSI.PASSWORD,
+                           password.encode("ascii"))
+
+    # ================================================================== #
+    # 调试功能B（MI=0x44）—— 关节行程起点/终点位置微调校准偏置（int8 向量）
+    # ------------------------------------------------------------------ #
+    # 两段各 36 个逻辑关节槽，块内偏移 == 关节物理子索引 si（见 DebugBSI）：
+    #   起点段 SI 0x00~0x23，终点段 SI 0x24~0x47。
+    # 读按 phys_span(25) 整段取回、按有效关节 si 解包(补码)；写同样按 si 落位，
+    # 空洞位(本机无电机)恒 0。⚠️ 写偏置须先 enter_engineering_password()，改完
+    # save_to_flash() 才掉电保留（仅起点段支持保存）。真机离线时收发均返回 None/False。
+    # ================================================================== #
+    def get_travel_start_offset(self) -> Optional[List[int]]:
+        """读各有效关节的行程「起点」位置偏置（MI 0x44 SI 0x00, int8），
+        按有效关节顺序返回有符号列表；读取失败返回 None。"""
+        body = self._request(MI.DEBUG_B, DebugBSI.START_BASE, self.phys_span,
+                             RTS.SETTING)
+        return self._unpack_i8(body) if body else None
+
+    def get_travel_end_offset(self) -> Optional[List[int]]:
+        """读各有效关节的行程「终点」位置偏置（MI 0x44 SI 0x24, int8），
+        按有效关节顺序返回有符号列表；读取失败返回 None。"""
+        body = self._request(MI.DEBUG_B, DebugBSI.END_BASE, self.phys_span,
+                             RTS.SETTING)
+        return self._unpack_i8(body) if body else None
+
+    def set_travel_start_offset(self, offsets: List[int],
+                                enter_password: bool = True) -> bool:
+        """写各有效关节的行程「起点」位置偏置（MI 0x44 SI 0x00, int8）。
+        offsets 长度须等于有效关节数(num_joints)，值裁剪到 [-128,127]。
+        enter_password=True 时先自动写工程服务密码解锁（见 enter_engineering_password）。
+        返回是否成功发送；持久化需另调 save_to_flash()。"""
+        if len(offsets) != self.num_joints:
+            return False
+        if enter_password and not self.enter_engineering_password():
+            return False
+        return self._write(MI.DEBUG_B, DebugBSI.START_BASE, self._pack_i8(offsets))
+
+    def set_travel_end_offset(self, offsets: List[int],
+                              enter_password: bool = True) -> bool:
+        """写各有效关节的行程「终点」位置偏置（MI 0x44 SI 0x24, int8）。
+        参数/密码语义同 set_travel_start_offset。"""
+        if len(offsets) != self.num_joints:
+            return False
+        if enter_password and not self.enter_engineering_password():
+            return False
+        return self._write(MI.DEBUG_B, DebugBSI.END_BASE, self._pack_i8(offsets))
+
+    def get_travel_offsets(self) -> Optional[Dict[str, List[int]]]:
+        """一次读回起点+终点两段偏置，返回 {'start': [...], 'end': [...]}；
+        任一段读取失败返回 None。"""
+        start = self.get_travel_start_offset()
+        if start is None:
+            return None
+        end = self.get_travel_end_offset()
+        if end is None:
+            return None
+        return {"start": start, "end": end}
+
+    def print_travel_offsets(self):
+        """打印各关节行程起点/终点位置偏置（MI 0x44），便于核对校准结果。"""
+        offs = self.get_travel_offsets()
+        if offs is None:
+            print("❌ 无法读取行程偏置（MI 0x44 超时/失败，真机可能未在线）")
+            return
+        print("=" * 50, flush=True)
+        print("关节行程位置偏置 (MI 0x44, int8):", flush=True)
+        print(f"  {'关节':16s} {'起点':>6s} {'终点':>6s}", flush=True)
+        for name, s, e in zip(self.joint_names, offs["start"], offs["end"]):
+            print(f"  {name:16s} {s:6d} {e:6d}", flush=True)
+        print("=" * 50, flush=True)
+
     # ================================================================== #
     # 触觉传感器（MI 0x31 命令/元信息 + 0x32/0x33/0x34 数据通道）
     # ------------------------------------------------------------------ #
@@ -1788,7 +1907,10 @@ class LinkerHandO30Controller:
                 return None, "数据总长度无效"
         info["total_length"] = total
         self._apply_sensor_layout(info)
-        info["plan"] = self._build_sensor_plan(total)
+        # ⚠️ 必须用补读后的 info["total_length"]（布局可能比 0x6C 报的更长，
+        # 如新 TASHAN_GATHER 的 Px），而不是局部变量 total——否则读取计划
+        # 仍按旧长度(10)分段，尾部 Px 永远读不到。
+        info["plan"] = self._build_sensor_plan(info["total_length"])
         if not info["plan"]:
             return None, "读取计划为空"
         # 试读数据通道首帧，确认数据区真的能读（部分固件只有 0x32 通道可用）
@@ -1810,8 +1932,17 @@ class LinkerHandO30Controller:
         layout = LinkerHandO30Controller._parse_sensor_layout(info.get("dist_desc", ""))
         info["layout"] = layout
         info["layout_length"] = sum(f["size"] for f in layout)
+        # 新传感器(TASHAN_GATHER)上报的数据总长度(0x6C)可能小于分布描述实际
+        # 长度(如 Px 未计入)，以分布描述为准补读，避免漏掉尾部字段；旧格式
+        # 两者一致，不受影响。
+        if info.get("total_length") is None:
+            info["total_length"] = info["layout_length"]
+        elif info["layout_length"] > info["total_length"]:
+            info["total_length"] = info["layout_length"]
+        # 标量力字段：个数==1 且标签属于 合力/点阵 族（兼容旧 FnS/FtS/FdS
+        # 与新 #Fn/Ft/Fd 标量力）
         info["force_fields"] = [f for f in layout
-                                if f["count"] == 1 and f["tag"] in SENSOR_FORCE_TAGS]
+                                if f["count"] == 1 and f["tag"] in SENSOR_SCALAR_FORCE_TAGS]
         # 点阵字段：优先取标签匹配的，否则取个数最大且 >1 的字段
         mat = next((f for f in layout if f["tag"] in SENSOR_MATRIX_TAGS and f["count"] > 1),
                    None)
@@ -2070,6 +2201,14 @@ class LinkerHandO30Controller:
             return None
         return int.from_bytes(raw[off:off+size], 'little', signed=signed)
 
+    @staticmethod
+    def _get_float(raw: bytes, off: int) -> Optional[float]:
+        """从 raw 的 off 处取 4 字节小端 IEEE754 float32；越界返回 None。
+        新传感器(TASHAN_GATHER)的 Fn/Ft 为 float，如字节 63 1E 1C 40 → 2.439。"""
+        if off + 4 > len(raw):
+            return None
+        return struct.unpack_from("<f", raw, off)[0]
+
     @classmethod
     def parse_tactile(cls, raw: bytes, info: Dict) -> Dict:
         """按缓存的字段布局解析一帧触觉原始数据（纯计算，不发帧）。
@@ -2084,13 +2223,21 @@ class LinkerHandO30Controller:
         分布描述缺失时退化为「整段都是点阵」，force 为空字典。
         """
         fields: Dict[str, object] = {}
-        force: Dict[str, int] = {}
+        force: Dict[str, object] = {}
         for f in info.get("layout") or ():
             if f["count"] == 1:
-                v = cls._get_int(raw, f["offset"], f["elem_size"], f["signed"])
+                # F32 按 IEEE754 float32 读(新传感器 Fn/Ft 为 float)；其余按整数读
+                if f["type"] == "F32":
+                    v = cls._get_float(raw, f["offset"])
+                else:
+                    v = cls._get_int(raw, f["offset"], f["elem_size"], f["signed"])
                 fields[f["tag"]] = v
-                if f["tag"] in SENSOR_FORCE_TAGS and v is not None:
-                    force[f["name"]] = v
+                # 标量力字段：标签属于 合力/点阵 族（兼容旧 FnS/FtS/FdS 与新
+                # #Fn/Ft/Fd；旧点阵 Fn/Ft/Fd 个数>1 走 else 分支不在此列）。
+                # force 以协议标签为键，与 get_tactile_summary/get_tactile_data
+                # 及集成测试(node_safety_check 期望 {"FnS": ...})保持一致。
+                if f["tag"] in SENSOR_SCALAR_FORCE_TAGS and v is not None:
+                    force[f["tag"]] = v
             else:
                 vals = [cls._get_int(raw, f["offset"] + i * f["elem_size"],
                                      f["elem_size"], f["signed"]) or 0
@@ -2258,8 +2405,8 @@ class LinkerHandO30Controller:
             "rows":     info.get("rows", 0),
             "cols":     info.get("cols", 0),
             "unit":     frame.get("unit", ""),
-            "force":    {tag: fields[tag] for tag in SENSOR_FORCE_TAGS
-                         if isinstance(fields.get(tag), int)},
+            "force":    frame["force"],
+            "fields":   fields,
             "matrix":   frame["matrix"],
             "cells":    cells,
             "cell_sum": sum(cells),

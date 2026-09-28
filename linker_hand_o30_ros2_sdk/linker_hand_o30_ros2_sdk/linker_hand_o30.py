@@ -28,7 +28,7 @@ O30 灵巧手 ROS2 驱动节点。
      /cb_<hand>_hand_info(温度/电流/关节故障/通信错误/在线/deadman)、
      /cb_<hand>_hand_matrix_touch(点阵) 与 _matrix_touch_mass(合力/统计)。
 '''
-import math
+import math,sys
 import time
 import json
 import threading
@@ -242,6 +242,12 @@ class LinkerHand(Node):
         model = (self.hand_info.get("产品型号") or "").strip()
         side = (self.hand_info.get("左右手") or "").strip()
         uid = (self.hand_info.get("设备唯一标识") or "").strip()
+        # 传感器类型：取第一个可用传感器的类型（本机五指都是同一型号）。
+        # 不再硬编码 sensors[1]——某些手可能拇指没装传感器，那样会 KeyError；
+        # 无传感器时留空串，后续按「非 TASHAN_GATHER」处理（不会误建点阵话题）。
+        _avail = self.linker_hand.get_available_sensors() or []
+        self.sensors_type = (self.linker_hand.sensors[_avail[0]]["type"]
+                             if _avail and _avail[0] in self.linker_hand.sensors else "")
         ColorMsg(msg=f"正在校验 {model or '未知型号'}-{side or '未知手别'} 设备，请稍候...",
                  color="yellow")
 
@@ -384,12 +390,14 @@ class LinkerHand(Node):
         self._pending_pose = None
         self._pending_vel = None
         self._pending_torque = None
+        self._pending_offset = None   # run() 循环会读它(设置行程偏移)，必须初始化
         # 已经写到设备里的速度/力矩：设备侧会锁存，值没变就不必再占一次总线事务
         self._last_sent_vel = None
         self._last_sent_torque = None
         self._last_cmd_time = None      # 最近一条合法命令的 monotonic 时间
         self._deadman_tripped = False
         self._rejected_cmds = 0
+        self._last_sent_offset = None
         self._read_fail = 0
         self._last_heartbeat = None
         self._online = True
@@ -413,7 +421,8 @@ class LinkerHand(Node):
             self.hand_state_rad_pub = self.create_publisher(JointState, f'/cb_{self.hand_type}_hand_state_rad', 10)
         # 判断是否存在触觉数据，如果存在则创建触觉数据发布器
         if self.is_touch:
-            self.matrix_touch_pub = self.create_publisher(
+            if self.sensors_type != "TASHAN_GATHER":
+                self.matrix_touch_pub = self.create_publisher(
                 String, f'/cb_{self.hand_type}_hand_matrix_touch', 10)
             self.matrix_touch_mass_pub = self.create_publisher(
                 String, f'/cb_{self.hand_type}_hand_matrix_touch_mass', 10)
@@ -589,6 +598,7 @@ class LinkerHand(Node):
             pose, self._pending_pose = self._pending_pose, None
             vel, self._pending_vel = self._pending_vel, None
             torque, self._pending_torque = self._pending_torque, None
+            offset, self._pending_offset = self._pending_offset, None
             last_cmd = self._last_cmd_time
 
         if self._deadman_tripped and any(x is not None for x in (pose, vel, torque)):
@@ -601,6 +611,22 @@ class LinkerHand(Node):
             if self.linker_hand.set_target_torque(torque) is not False:
                 self._last_sent_torque = list(torque)
             time.sleep(0.002)
+        if offset is not None and offset != self._last_sent_offset:
+            # TODO::设置偏移量
+            #print(offset, flush=True)
+            o_min, o_max = zip(*offset)
+            off_min = [0 + x for x in o_min]
+            off_max = [255 - y for y in o_max]
+            set_min = self.linker_hand.set_travel_start_offset(offsets=off_min)
+            time.sleep(0.002)
+            set_max = self.linker_hand.set_travel_end_offset(offsets=off_max)
+            time.sleep(0.002)
+            save = self.linker_hand.save_to_flash()
+            if set_min == True and set_max == True:
+                ColorMsg(msg=f"偏移量已设置，需要断电重启", color="yellow")
+                self.linker_hand.print_travel_offsets()
+                sys.exit(0)
+            ColorMsg(msg=f"偏移量已设置失败，保存不成功", color="red")
         if pose is not None:
             self.linker_hand.set_target_position(pose)
             time.sleep(0.002)
@@ -647,16 +673,16 @@ class LinkerHand(Node):
             self._warn("pos_read", f"⚠️ 读取关节位置失败（累计 {self._read_fail} 次）")
             return
         self._read_fail = 0
-        vel = self.linker_hand.get_current_velocity() if self.publish_velocity else None
-        effort = self.linker_hand.get_motor_current() if self.publish_effort else None
-        self.hand_state_pub.publish(self.joint_state_msg(pose, vel=vel, effort=effort))
+        #vel = self.linker_hand.get_current_velocity() if self.publish_velocity else None
+        #effort = self.linker_hand.get_motor_current() if self.publish_effort else None
+        self.hand_state_pub.publish(self.joint_state_msg(pose))
         self._tick("state")
         if self.is_rad == True:
             if self.hand_type == "left":
                 rad_pose = range_to_rad_left(pose, self.hand_joint)
             else:
                 rad_pose = range_to_rad_right(pose, self.hand_joint)
-            self.hand_state_rad_pub.publish(self.joint_state_msg(rad_pose, vel=vel, effort=effort))
+            self.hand_state_rad_pub.publish(self.joint_state_msg(rad_pose))
             self._tick("state_rad")
             
     def joint_state_msg(self, pose, vel=None, effort=None):
@@ -687,14 +713,18 @@ class LinkerHand(Node):
             if self.touch_publish_matrix:
                 matrix[key] = {"name": d.get("name"), "rows": d.get("rows"),
                                "cols": d.get("cols"), "matrix": d.get("matrix")}
+            try:
+                px = d["fields"]["Px"]
+            except:
+                px = None
             mass[key] = {"name": d.get("name"), "unit": d.get("unit"),
-                         "force": d.get("force"), "cell_sum": d.get("cell_sum"),
+                         "force": d.get("force"),"px":px, "cell_sum": d.get("cell_sum"),
                          "cell_max": d.get("cell_max")}
         if not mass:
             self._warn("touch_read", "⚠️ 触觉读取失败（全部传感器无数据）")
             return
         stamp = self.get_clock().now().nanoseconds
-        if self.touch_publish_matrix:
+        if self.touch_publish_matrix and self.sensors_type != "TASHAN_GATHER":
             self.matrix_touch_pub.publish(
                 String(data=json.dumps({"stamp": stamp, "hand_type": self.hand_type,
                                         "sensors": matrix}, ensure_ascii=False)))
@@ -707,6 +737,7 @@ class LinkerHand(Node):
         '''诊断信息：温度/电流/关节故障/通信错误码/在线状态/deadman 状态。'''
         temps = self.linker_hand.get_temperature()
         currents = self.linker_hand.get_motor_current()
+        speed = self.linker_hand.get_current_velocity()
         faults = self.linker_hand.get_joint_faults()
         # 心跳递增即在线（比 is_online() 省一次事务与 0.1s 阻塞）
         hb = self.linker_hand.get_heartbeat()
@@ -744,6 +775,7 @@ class LinkerHand(Node):
             "online": self._online,
             "temperature": temps or [],
             "over_temp": over_temp,
+            "speed": speed or [],
             "current": currents or [],
             "joint_faults": faults or {},
             "comm_error": {"code": err,
@@ -776,10 +808,17 @@ class LinkerHand(Node):
     # ------------------------------------------------------------------ #
     def hand_setting_cb(self, msg):
         '''设置命令回调。
-
         ⚠️ /cb_hand_setting_cmd 是全局话题，双手启动时两个节点都会收到同一条消息，
            因此必须比对 params.hand_type 与本节点的 self.hand_type：不一致直接丢弃，
            否则给右手设速度会把左手也一起改掉。缺省/"both"/"all" 视为广播。
+           设置偏移量：
+           ros2 topic pub /cb_hand_setting_cmd std_msgs/msg/String 'data: "{\"setting_cmd\": \"set_offset\", \"params\": {\"hand_type\": \"left\", \"offset\": [[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240],[10,240]]}}"' --once
+           还原偏移量：
+           ros2 topic pub /cb_hand_setting_cmd std_msgs/msg/String 'data: "{\"setting_cmd\": \"set_offset\", \"params\": {\"hand_type\": \"left\", \"offset\": [[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255],[0,255]]}}"' --once
+
+           {"setting_cmd": "set_offset", "params": {"hand_type": "left", "offset": [[10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], [10,240], ]}}
+           数据说明[最小范围值,最大范围值] 最小范围值不得小于0，最大范围值不得大于255，int类型
+           数据顺序['thumb_roll', 'thumb_yaw', 'index_yaw', 'middle_yaw', 'ring_yaw', 'little_yaw', 'thumb_root1', 'index_root1', 'middle_root1', 'ring_root1', 'little_root1', 'index_root2', 'middle_root2', 'ring_root2', 'little_root2', 'thumb_tip', 'index_tip', 'middle_tip', 'ring_tip', 'little_tip']
         '''
         try:
             data = json.loads(msg.data)
@@ -805,6 +844,7 @@ class LinkerHand(Node):
                 "set_max_torque_limits": self._cmd_set_torque,
                 "get_faults":            self._cmd_get_faults,
                 "get_info":              self._cmd_get_info,
+                "set_offset":            self._set_offset,
                 "enable_joints":         self._cmd_enable_joints,
                 "disable_joints":        self._cmd_disable_joints,
             }.get(cmd)
@@ -814,6 +854,23 @@ class LinkerHand(Node):
             handler(params)
         except Exception as e:
             ColorMsg(msg=f"⚠️ 设置命令 {cmd} 执行失败: {e}", color="yellow")
+
+    def _set_offset(self, params):
+        offset = params.get("offset")
+        if not isinstance(offset, list) or not offset:
+            ColorMsg(msg="⚠️ offset 参数错误：应为非空二维列表（长度 20）",
+                                 color="yellow")
+            return
+        
+        # ok, vals = self._sanitize_vector(offset, "offset", U8_MIN, U8_MAX, throttle=False)
+        # if not ok:
+        #     return
+        vals = offset
+        print(f"设置偏移量{vals}", flush=True)
+        with self._cmd_lock:
+            # 只排队，由控制线程统一写总线（回调线程不碰总线，也避免写两遍）
+            self._pending_offset = vals
+            self._last_cmd_time = time.monotonic()
 
     def _cmd_set_speed(self, params):
         speed = params.get("speed")
