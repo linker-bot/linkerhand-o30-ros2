@@ -207,7 +207,7 @@ sudo ip link set can0 up
 
 ```bash
 $ mkdir -p Linker_Hand_O30_ROS2_SDK/src    # 创建工程目录
-$ cd ~/Linker_Hand_O30_ROS2_SDK/src
+$ cd Linker_Hand_O30_ROS2_SDK/src
 $ git clone https://github.com/linker-bot/linkerhand-o30-ros2.git
 ```
 
@@ -225,9 +225,9 @@ Linker_Hand_O30_ROS2_SDK/
 ## 5.5 安装依赖与编译
 
 ```bash
-$ cd ~/Linker_Hand_O30_ROS2_SDK/src/linkerhand-o30-ros2
+$ cd Linker_Hand_O30_ROS2_SDK/src/linkerhand-o30-ros2
 $ pip install -r requirements.txt          # 安装 Python 依赖(含 python-can)
-$ cd ~/Linker_Hand_O30_ROS2_SDK            # 回到工程根目录
+$ cd Linker_Hand_O30_ROS2_SDK            # 回到工程根目录
 $ colcon build --symlink-install           # 编译和构建 ROS 包
 $ source ./install/setup.bash
 ```
@@ -279,7 +279,7 @@ $ source ./install/setup.bash
 ## 6.2 启动单手
 
 ```bash
-$ cd ~/Linker_Hand_O30_ROS2_SDK
+$ cd Linker_Hand_O30_ROS2_SDK
 $ source ./install/setup.bash
 $ ros2 launch linker_hand_o30_ros2_sdk linker_hand_o30.launch.py
 ```
@@ -327,7 +327,7 @@ $ ros2 launch linker_hand_o30_ros2_sdk linker_hand_o30_double.launch.py
 编辑 `src/linkerhand-o30-ros2/gui_control/launch/gui_control.launch.py` 配置左右手、型号等参数，然后启动：
 
 ```bash
-$ cd ~/Linker_Hand_O30_ROS2_SDK
+$ cd Linker_Hand_O30_ROS2_SDK
 $ source ./install/setup.bash
 $ ros2 launch gui_control gui_control.launch.py
 ```
