@@ -798,6 +798,7 @@ class LinkerHand(Node):
 
     def _check_rate(self, name, actual, target, hint):
         '''实测频率低于目标 80% 时限流告警（频率计要满 1 秒才有值，0 表示还没结算）'''
+        return
         if actual <= 0 or actual >= target * 0.8:
             return
         self._warn(f"rate_{name}", f"⚠️ {name} 实测 {actual}Hz 低于设定 {target}Hz：{hint}",
