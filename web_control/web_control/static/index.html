@@ -1,0 +1,999 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦾</text></svg>">
+<title>灵巧手 Web 控制台</title>
+<script type="importmap">
+  { "imports": { "three": "/lib/three/build/three.module.js" } }
+</script>
+<style>
+:root {
+  --bg: #0f1420;
+  --panel: #171e2e;
+  --border: #2a3550;
+  --text: #e8edf7;
+  --muted: #8b98b8;
+  --accent: #4da3ff;
+  --ok: #37d67a;
+  --err: #ff5d5d;
+  --warn: #ffb74d;
+  --cur: #a6aec4;   /* 电机当前位置: 暗灰, 灰度略高于温度值(--muted #8b98b8) */
+  --zoom: 1;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+/* 显示器缩放: 基础字号按窗口宽度随 --zoom 等比缩放 (16px × zoom),
+   全页 rem 字体与间距同比例跟随; canvas 另按 devicePixelRatio 提分辨率, 高倍缩放下依旧清晰 */
+html { font-size: calc(16px * var(--zoom, 1)); }
+html, body { height: 100%; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+
+/* ---------- 顶栏 ---------- */
+header {
+  display: flex; align-items: center; gap: .75rem;
+  padding: .5rem 1rem; background: var(--panel);
+  border-bottom: 1px solid var(--border); flex: none;
+}
+header h1 { font-size: .9375rem; font-weight: 600; }
+.dot {
+  width: .625rem; height: .625rem; border-radius: 50%;
+  background: var(--err); box-shadow: 0 0 .5rem var(--err); flex: none;
+}
+.dot.on { background: var(--ok); box-shadow: 0 0 .5rem var(--ok); }
+.meta { color: var(--muted); font-size: .8125rem; white-space: nowrap; }
+.spacer { flex: 1; }
+
+/* ---------- 主体 ---------- */
+main {
+  flex: 1; min-height: 0;
+  display: grid; grid-template-columns: minmax(22rem, 46%) 1fr;
+  gap: .625rem; padding: .625rem .875rem;
+}
+/* 断点用 rem (900px ÷ 16px): 随显示器缩放的字号一起变化, 布局切换与 UI 比例保持一致 */
+@media (max-width: 56.25rem) { main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } }
+.panel {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: .75rem; display: flex; flex-direction: column; min-height: 0;
+}
+.panel > h2 {
+  font-size: .8125rem; padding: .4375rem .75rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted); font-weight: 600; letter-spacing: .5px; flex: none;
+}
+  /* 关节控制开关: 标题右侧按钮, 开启(绿)/关闭(橙)两态 */
+  #jc-title { display: flex; align-items: center; }
+  .jc-ctrl {
+    margin-left: auto; font-size: .6875rem; font-weight: 600; font-family: inherit;
+    padding: .3125rem .75rem; border-radius: .4375rem;
+    border: 1px solid var(--border); background: transparent;
+    color: var(--muted); cursor: pointer; user-select: none;
+    transition: background .15s, color .15s, border-color .15s, box-shadow .15s;
+  }
+  .jc-ctrl:hover { filter: brightness(1.12); }
+  .jc-ctrl.on {
+    background: rgba(55, 214, 122, .16); color: var(--ok); border-color: rgba(55, 214, 122, .55);
+    box-shadow: 0 0 .5rem rgba(55, 214, 122, .3);
+  }
+  .jc-ctrl.off {
+    background: rgba(255, 183, 77, .12); color: var(--warn); border-color: rgba(255, 183, 77, .5);
+  }
+
+.right { display: grid; grid-template-rows: 1.15fr 1fr; gap: .625rem; min-height: 0; }
+
+/* ---------- 滑动条 ---------- */
+.sliders { flex: 1; overflow-y: auto; padding: .25rem .75rem .375rem; }
+.empty { color: var(--muted); text-align: center; padding: 2.5rem .625rem; font-size: .8125rem; }
+.group { margin-top: .375rem; }
+.group-title {
+  font-size: .75rem; color: var(--accent);
+  padding: 2px 0 2px; margin-bottom: 3px;
+  border-bottom: 1px dashed var(--border);
+}
+.row {
+  display: grid; grid-template-columns: minmax(9rem, 12rem) 1fr auto;
+  gap: .5rem; align-items: center; padding: 1.5px 0;
+}
+.row label {
+  font-size: .75rem; line-height: 1.15;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.row label .en { font-size: .625rem; color: var(--muted); }
+input[type=range] { width: 100%; accent-color: var(--accent); cursor: pointer; }
+.val {
+  display: flex; justify-content: flex-end; align-items: baseline;
+  gap: .625rem; color: var(--muted); font-size: .75rem;
+}
+.val .num {
+  font-variant-numeric: tabular-nums; text-align: right;
+  color: var(--warn); font-size: .75rem;
+}
+.val .cur {
+  font-variant-numeric: tabular-nums; text-align: right;
+  color: var(--cur); font-size: .75rem; min-width: 3ch;
+}
+.val .temp {
+  font-variant-numeric: tabular-nums; color: var(--muted);
+  font-size: .75rem; min-width: 5ch; text-align: right;
+}
+.val .temp.warn { color: #e6c200; }   /* 60~70°C 深黄色 (警告) */
+.val .temp.hot  { color: #ff0000; }   /* >70°C 纯红色 */
+
+/* ---------- 占位区 ---------- */
+.placeholder {
+  flex: 1; margin: .625rem;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: .625rem; color: var(--muted); font-size: .875rem; text-align: center;
+  border: 1px dashed var(--border); border-radius: .625rem;
+}
+.placeholder .big { font-size: 1.5rem; opacity: .8; }
+.placeholder small { font-size: .75rem; opacity: .65; }
+
+/* ---------- 触觉区: 热力图(1/3) + 波形图(2/3) 左右拆分 ---------- */
+.panel h2 .h2meta {
+  float: right; font-weight: 400; font-size: .6875rem;
+  color: var(--muted); letter-spacing: 0;
+}
+.touch-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  gap: .625rem; min-height: 0;
+}
+/* 热力图: 3 列网格 (上3指/中2指/手掌整行), 每格 6px; 手掌矩阵通常更大故独占一行 */
+.touch-body {
+  flex: 1; min-height: 0; display: flex; flex-direction: column;
+  gap: .375rem; padding: .375rem .5rem .5rem;
+}
+.touch-list {
+  flex: 1; min-height: 0; overflow-y: auto;
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: .375rem; align-content: start;
+}
+.touch-item {
+  display: flex; flex-direction: column; align-items: center; gap: .1875rem;
+  background: #101828; border: 1px solid var(--border); border-radius: .375rem;
+  padding: .3125rem .375rem; min-width: 0;
+}
+.touch-item.palm { grid-column: 1 / -1; }
+.touch-item canvas {
+  display: block; border-radius: 2px; background: #0d1322;
+}
+.ti-foot {
+  width: 100%; display: flex; justify-content: space-between;
+  align-items: baseline; gap: .375rem;
+}
+.ti-label {
+  font-size: .6875rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ti-label .en { color: var(--muted); font-size: .625rem; }
+.ti-mx {
+  flex: none;
+  color: var(--warn); font-size: .6875rem; font-variant-numeric: tabular-nums;
+}
+.touch-item.nodata canvas { opacity: .35; }
+.touch-item.nodata .ti-mx { color: var(--muted); }
+.touch-legend {
+  flex: none; display: flex; align-items: center; gap: .5rem;
+  font-size: .625rem; color: var(--muted);
+}
+.touch-legend .bar {
+  flex: 1; height: .5rem; border-radius: .25rem;
+  background: linear-gradient(90deg, #0d1322, #183a6b 15%, #178080 40%, #56be50 65%, #f0c832 85%, #ff4d3d);
+}
+/* 波形图: 一个窗口内每传感器一条不同颜色曲线, 底部图例 */
+.wave-body {
+  flex: 1; min-height: 0; display: flex; flex-direction: column;
+  gap: .25rem; padding: .375rem .625rem .5rem;
+}
+#wave-canvas { flex: 1; min-height: 0; width: 100%; display: block; }
+.wave-legend {
+  flex: none; display: flex; flex-wrap: wrap;
+  gap: .25rem 1rem; font-size: .6875rem; color: var(--muted);
+}
+.wl-item { display: inline-flex; align-items: center; gap: .3125rem; white-space: nowrap; }
+.wl-sw { width: .875rem; height: .1875rem; border-radius: .125rem; flex: none; }
+.wl-val { color: var(--text); font-variant-numeric: tabular-nums; }
+.wl-empty { color: #5b6a8c; font-size: .625rem; }
+
+/* ---------- URDF 3D ---------- */
+.urdf-wrap { flex: 1; margin: .625rem; display: flex; flex-direction: column; min-height: 0; }
+.urdf-view {
+  flex: 1; min-height: 0; position: relative;
+  border: 1px solid var(--border); border-radius: .625rem; overflow: hidden;
+  background: radial-gradient(ellipse at 50% 30%, #1c2540 0%, #10141f 78%);
+}
+.urdf-view canvas { display: block; }
+.urdf-status {
+  flex: none; text-align: center; font-size: .6875rem;
+  color: var(--muted); padding: .25rem .25rem 0;
+}
+.urdf-status.ok { color: var(--ok); }
+.urdf-status.err { color: var(--err); }
+
+/* ---------- 日志 ---------- */
+footer { flex: none; background: var(--panel); border-top: 1px solid var(--border); }
+#log {
+  height: 4.75rem; overflow-y: auto; padding: .375rem 1rem;
+  font-size: .75rem; font-family: ui-monospace, Consolas, monospace; color: var(--muted);
+}
+#log .ok { color: var(--ok); }
+#log .err { color: var(--err); }
+#log .cmd { color: var(--warn); }
+
+/* 小视口进一步压缩: 优先保证 20 条滑动条完整可见、不出现滚动条 */
+@media (max-height: 48.75rem) {
+  header { padding: .375rem .875rem; }
+  #log { height: 3.5rem; }
+  .group { margin-top: .25rem; }
+  .group-title { padding: 1px 0; margin-bottom: 2px; }
+  .row { padding: 1px 0; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>🤖 灵巧手 Web 控制台 (实验性)</h1>
+  <span class="dot" id="dot"></span>
+  <span class="meta" id="conn">未连接</span>
+  <span class="meta" id="joints">关节: --</span>
+  <span class="meta" id="upd">最后下发: --</span>
+  <div class="spacer"></div>
+  <span class="meta" id="hand">手部: --</span>
+</header>
+
+<main>
+  <!-- 左: 关节控制滑动条 -->
+  <section class="panel">
+    <h2 id="jc-title">关节控制 · 0~255 (拖动实时下发)
+      <button id="jc-ctrl" type="button" class="jc-ctrl on">已开启控制</button>
+    </h2>
+    <div class="sliders" id="sliders">
+      <div class="empty">等待状态消息，收到后自动生成滑动条…</div>
+    </div>
+  </section>
+
+  <!-- 右: [热力图(1/3) | 波形图(2/3)] + URDF 3D -->
+  <div class="right">
+    <div class="touch-row">
+      <section class="panel">
+        <h2>触觉矩阵热力图<span class="h2meta" id="touch-meta">等待触觉数据…</span></h2>
+        <div class="touch-body">
+          <div class="touch-list" id="touch-list"></div>
+          <div class="touch-legend"><span>0</span><span class="bar"></span><span id="touch-scale">尺度 —</span></div>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>波形图 · 合力 FnS<span class="h2meta" id="wave-meta">等待合力数据…</span></h2>
+        <div class="wave-body">
+          <canvas id="wave-canvas"></canvas>
+          <div class="wave-legend" id="wave-legend"></div>
+        </div>
+      </section>
+    </div>
+    <section class="panel">
+      <h2>URDF 3D 显示</h2>
+      <div class="urdf-wrap">
+        <div id="urdf-view" class="urdf-view"></div>
+        <div id="urdf-status" class="urdf-status">正在加载 URDF…</div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer><div id="log"></div></footer>
+
+<script>
+'use strict';
+
+/* ---------- 关节中文名 (与 SDK JOINT_MAP 一致, 找不到时只显示英文名) ---------- */
+const JOINT_CN = {
+  thumb_roll: '拇指横滚', thumb_yaw: '拇指航向',
+  index_yaw: '食指航向', middle_yaw: '中指航向', ring_yaw: '无名指航向', little_yaw: '小指航向',
+  thumb_root1: '拇指指根1', index_root1: '食指指根1', middle_root1: '中指指根1',
+  ring_root1: '无名指指根1', little_root1: '小指指根1',
+  index_root2: '食指指根2', middle_root2: '中指指根2', ring_root2: '无名指指根2', little_root2: '小指指根2',
+  thumb_tip: '拇指指尖', index_tip: '食指指尖', middle_tip: '中指指尖', ring_tip: '无名指指尖', little_tip: '小指指尖',
+};
+const GROUPS = [
+  { key: 'thumb',  label: '👍 拇指' },
+  { key: 'index',  label: '☝️ 食指' },
+  { key: 'middle', label: '🖖 中指' },
+  { key: 'ring',   label: '💍 无名指' },
+  { key: 'little', label: '🤙 小指' },
+  { key: 'other',  label: '📌 其他' },
+];
+
+/* ---------- 关节顺序与数量 (全部来自 /cb_<hand>_hand_state, 兼容任意机械手) ---------- */
+let jointNames = [];          // 当前关节顺序 (= 状态话题 name 顺序)
+let slidersBuilt = false;     // 滑动条是否已生成 (等待状态消息)
+let signature = '';           // 当前已构建的关节签名
+const sliders = new Map();    // name -> {input, val}
+const dragging = new Set();   // 正在拖动中的关节
+let lastPub = 0;              // 上次下发时刻 (ms)
+let pubQueued = false;        // 是否已排一个待发任务
+let controlOn = true;         // 关节控制开关: 开启=30Hz持续下发, 关闭=30Hz监听回显
+const CTRL_PERIOD_MS = 33;    // ~30Hz 周期 (33ms)
+let ctrlTimer = null;         // 控制循环定时器
+
+/* ---------- 小工具 ---------- */
+function ts() { return new Date().toTimeString().slice(0, 8); }
+function log(msg, cls = '') {
+  const el = document.getElementById('log');
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = `[${ts()}] ${msg}`;
+  el.appendChild(line);
+  while (el.children.length > 200) el.removeChild(el.firstChild);
+  el.scrollTop = el.scrollHeight;
+}
+function groupOf(name) {
+  for (const g of GROUPS) {
+    if (g.key !== 'other' && name.startsWith(g.key + '_')) return g.key;
+  }
+  return 'other';
+}
+function setConn(on) {
+  const dot = document.getElementById('dot');
+  const conn = document.getElementById('conn');
+  dot.className = 'dot' + (on ? ' on' : '');
+  conn.textContent = on ? '已连接' : '未连接 (自动重连中)';
+}
+
+/* ---------- 滑动条 (收到状态消息后生成: 关节名与数量均由 /cb_<hand>_hand_state 决定) ---------- */
+function buildSliders(names, initial) {
+  jointNames = names.slice();
+  signature = jointNames.join('\u0000');
+  const box = document.getElementById('sliders');
+  box.innerHTML = '';
+  sliders.clear();
+  dragging.clear();
+
+  for (const g of GROUPS) {
+    const items = jointNames.filter(n => groupOf(n) === g.key);
+    if (!items.length) continue;
+    const grp = document.createElement('div');
+    grp.className = 'group';
+    const title = document.createElement('div');
+    title.className = 'group-title';
+    title.textContent = g.label;
+    grp.appendChild(title);
+
+    for (const n of items) {
+      const row = document.createElement('div');
+      row.className = 'row';
+
+      const label = document.createElement('label');
+      const cn = JOINT_CN[n] ? JOINT_CN[n] + ' ' : '';
+      label.innerHTML = `${cn}<span class="en">${n}</span>`;
+
+      const input = document.createElement('input');
+      input.type = 'range';
+      input.min = '0'; input.max = '255'; input.step = '1';
+      const i = jointNames.indexOf(n);
+      input.value = String((initial && Number.isFinite(initial[i])) ? Math.round(initial[i]) : 128);
+      input.setAttribute('aria-label', n);
+
+      const val = document.createElement('span');
+      val.className = 'val';
+      const num = document.createElement('span');
+      num.className = 'num';
+      num.textContent = input.value;
+      const cur = document.createElement('span');
+      cur.className = 'cur';
+      cur.textContent = (initial && Number.isFinite(initial[i])) ? String(Math.round(initial[i])) : '—';
+      const temp = document.createElement('span');
+      temp.className = 'temp';
+      temp.textContent = '—';
+      val.append(num, cur, temp);
+
+      const setVal = () => { num.textContent = input.value; };
+      setVal();
+
+      input.addEventListener('input', () => {
+        dragging.add(n);
+        setVal();
+        pushViewerState();
+        schedulePublish(false);
+      });
+      input.addEventListener('change', () => {
+        dragging.delete(n);
+        setVal();
+        pushViewerState();
+        schedulePublish(true);   // 松手补发最终值
+      });
+
+      sliders.set(n, { input, val, num, cur, temp });
+      row.append(label, input, val);
+      grp.appendChild(row);
+    }
+    box.appendChild(grp);
+  }
+  log(`已生成 ${jointNames.length} 个关节滑动条 (初始值: ${jointNames.map(n => sliders.get(n).input.value).join(',')})`, 'ok');
+  document.getElementById('joints').textContent = `关节: ${jointNames.length}`;
+  pushViewerState();   // 初始姿态同步给 3D 查看器
+}
+
+/* ---------- 等待状态消息: 关节名与数量由服务端 (/cb_<hand>_hand_state) 决定, 轮询到后生成滑动条 ---------- */
+async function ensureSliders() {
+  if (slidersBuilt) return;
+  const r = await fetch('/api/status', { cache: 'no-store' });
+  const d = await r.json();
+  if (!d || !d.ok || !Array.isArray(d.names) || d.names.length === 0) return;
+  buildSliders(d.names, Array.isArray(d.positions) ? d.positions : null);
+  slidersBuilt = true;
+  log(`已收到状态消息: ${d.names.length} 个关节 (初始值取当前状态)`, 'ok');
+}
+ensureSliders().catch(() => {});
+setInterval(() => { if (!slidersBuilt) ensureSliders().catch(() => {}); }, 1000);
+
+/* ---------- 温度显示: 1Hz 轮询 /api/info, 温度数组顺序与滑块(jointNames)一致 ---------- */
+const TEMP_POLL_MS = 1000;
+const TEMP_WARN_C = 60;   // 超过此值 → 深黄色(警告)
+const TEMP_HOT_C = 70;    // 超过此值 → 纯红色
+async function updateTemps() {
+  try {
+    const r = await fetch('/api/info', { cache: 'no-store' });
+    const d = await r.json();
+    if (!(d && d.ok && Array.isArray(d.temperature))) return;
+    for (const n of jointNames) {
+      const s = sliders.get(n);
+      if (!s || !s.temp) continue;
+      const t = d.temperature[jointNames.indexOf(n)];
+      if (t === null || t === undefined || Number.isNaN(t)) {
+        s.temp.textContent = '—';
+        s.temp.classList.remove('hot');
+        s.temp.classList.remove('warn');
+      } else {
+        const tv = Number(t);
+        s.temp.textContent = tv + '°C';
+        s.temp.classList.toggle('warn', tv > TEMP_WARN_C && tv <= TEMP_HOT_C);  // 60~70°C 深黄(警告)
+        s.temp.classList.toggle('hot',  tv > TEMP_HOT_C);                       // >70°C 纯红
+      }
+    }
+  } catch (e) {
+    /* 未连接/设备离线时保持上次显示, 不打扰 */
+  }
+}
+updateTemps();
+setInterval(updateTemps, TEMP_POLL_MS);
+
+/* ---------- 电机当前位置: ~30Hz 轮询 /api/status (状态话题 /cb_<hand>_hand_state 发布频率 30Hz) ----------
+ * 数据源: /cb_<hand>_hand_state 的 position (经 /api/status 的 positions 数组, 0~255) */
+const CUR_POLL_MS = 33;
+async function updateCurs() {
+  try {
+    const r = await fetch('/api/status', { cache: 'no-store' });
+    const d = await r.json();
+    if (!(d && d.ok && Array.isArray(d.positions))) return;
+    for (let i = 0; i < jointNames.length; i++) {
+      const s = sliders.get(jointNames[i]);
+      if (!s || !s.cur) continue;
+      const p = d.positions[i];
+      if (p === null || p === undefined || !Number.isFinite(p)) {
+        s.cur.textContent = '—';
+      } else {
+        s.cur.textContent = String(Math.round(p));
+      }
+    }
+  } catch (e) {
+    /* 未连接/设备离线时保持上次显示, 不打扰 */
+  }
+}
+updateCurs();
+setInterval(updateCurs, CUR_POLL_MS);
+
+/* ---------- 触觉区: 热力图(1/3) + 波形图(2/3) 左右布局, 30Hz 轮询 /api/touch ----------
+ * 数据: data.sensors {"1"~"5": 手指, "6": 手掌(可选)} = {name, rows, cols, matrix}
+ * 手指数量完全由消息决定; 手掌槽位(6)始终预留; 每指独立自适应色标(峰值缓慢衰减防闪烁) */
+const TOUCH_POLL_MS = 33;   // ~30Hz 轮询, 与 SDK 触觉发布频率 (touch_rate 30Hz) 对齐
+const PALM_KEY = '6';   // 手掌传感器号 (当前 O30 无此传感器, 槽位永久预留)
+const CELL_PX = 6;      // 热力图每格占用像素 (5px 点 + 1px 间隙)
+const TOUCH_CN = { thumb: '拇指', index: '食指', middle: '中指', ring: '无名指', pinky: '小指', palm: '手掌' };
+const TOUCH_EN = { 1: 'thumb', 2: 'index', 3: 'middle', 4: 'ring', 5: 'pinky', 6: 'palm' };
+const TOUCH_ICON = { 1: '👍', 2: '☝️', 3: '🖖', 4: '💍', 5: '🤙', 6: '✋' };
+const touchTiles = new Map();   // key -> {canvas, ctx, mxEl, enEl, itemEl}
+let touchSig = '';              // 当前已构建的槽位签名
+let activeKeys = [];            // 当前传感器顺序 (热力图槽位用)
+const touchPeaks = new Map();   // key -> 自适应色标 (峰值, 逐帧衰减)
+
+/* 显示器缩放: 以 2560px 窗口宽度为设计基准 (原 1280, 整体缩放减半);
+   字号/间距随 zoom 等比 (rem), canvas 缓冲区再乘 devicePixelRatio,
+   高分屏/高倍缩放下线条清晰 */
+const ZOOM_BASE = 2560;   // 设计基准窗口宽度 (px) (1280 × 2 = 缩放减半)
+const ZOOM_MIN = 0.35, ZOOM_MAX = 0.9;  // zoom 限制范围 (原 0.7~1.8, 减半)
+const ZOOM_FACTOR = 1.3;  // 整体系数: 在减半基础上再放大 30% (如 0.9 → 1.17)
+function getZoomFactor() {
+  return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, window.innerWidth / ZOOM_BASE)) * ZOOM_FACTOR;
+}
+/* dpr 上限 3: 覆盖 250%/300% 系统缩放与浏览器放大; 再高内存开销大、视觉收益小 */
+function dprScale() { return Math.min(window.devicePixelRatio || 1, 3); }
+
+/* 色标 (分段线性插值): 暗 → 蓝 → 青 → 绿 → 黄 → 红 */
+const HEAT_STOPS = [
+  [0.00, [13, 19, 34]],
+  [0.15, [24, 58, 107]],
+  [0.40, [23, 128, 128]],
+  [0.65, [86, 190, 80]],
+  [0.85, [240, 200, 50]],
+  [1.00, [255, 77, 61]],
+];
+function heatColor(t) {
+  t = Math.max(0, Math.min(1, t));
+  for (let i = 1; i < HEAT_STOPS.length; i++) {
+    if (t <= HEAT_STOPS[i][0]) {
+      const [t0, c0] = HEAT_STOPS[i - 1], [t1, c1] = HEAT_STOPS[i];
+      const f = (t - t0) / ((t1 - t0) || 1);
+      const r = Math.round(c0[0] + (c1[0] - c0[0]) * f);
+      const g = Math.round(c0[1] + (c1[1] - c0[1]) * f);
+      const b = Math.round(c0[2] + (c1[2] - c0[2]) * f);
+      return `rgb(${r},${g},${b})`;
+    }
+  }
+  return 'rgb(255,77,61)';
+}
+
+/* 按传感器集合构建槽位 (数量变化时才重建; 手掌槽位始终包含)
+ * 3 列网格: 拇指/食指/中指 | 无名指/小指 | 手掌(独占整行, 矩阵通常更大) */
+function ensureTouchTiles(keys) {
+  const sig = keys.join('\u0000');
+  if (sig === touchSig) return;
+  touchSig = sig;
+  activeKeys = keys.slice();
+  const list = document.getElementById('touch-list');
+  list.innerHTML = '';
+  touchTiles.clear();
+  for (const k of keys) {
+    const en = TOUCH_EN[k] || '';
+    const item = document.createElement('div');
+    item.className = 'touch-item nodata' + (k === PALM_KEY ? ' palm' : '');
+    const cv = document.createElement('canvas');
+    setTileCanvasSize(cv, 7, 10);   // 默认 10×7, 首帧数据后按实际行列调整
+    const foot = document.createElement('div');
+    foot.className = 'ti-foot';
+    const label = document.createElement('div');
+    label.className = 'ti-label';
+    label.innerHTML = `${TOUCH_ICON[k] || '📡'}<span class="en"> ${en}</span>`;
+    const mx = document.createElement('span');
+    mx.className = 'ti-mx';
+    mx.textContent = '—';
+    foot.append(label, mx);
+    item.append(cv, foot);
+    list.appendChild(item);
+    touchTiles.set(k, {
+      canvas: cv, ctx: cv.getContext('2d'),
+      mxEl: mx, enEl: label.querySelector('.en'), itemEl: item,
+    });
+  }
+}
+
+/* 显示器缩放: 格子宽度随窗口缩放; 画布缓冲区按 dpr 提升分辨率, 高分屏清晰 */
+function scaledCell() { return CELL_PX * getZoomFactor(); }
+
+function setTileCanvasSize(cv, cols, rows) {
+  const W = cols * scaledCell(), H = rows * scaledCell();
+  const dpr = dprScale();
+  cv.width = Math.max(1, Math.round(W * dpr));
+  cv.height = Math.max(1, Math.round(H * dpr));
+  cv.style.width = W + 'px';
+  cv.style.height = H + 'px';
+}
+
+/* 绘制矩阵: 每格 CELL_PX 间距, 点占 CELL_PX-1 px (保留网格感); 画布随实际行列调整 */
+function drawMatrix(ctx, matrix, norm) {
+  const rows = matrix.length, cols = matrix[0].length;
+  const cell0 = scaledCell();
+  const dpr = dprScale();
+  const W = cols * cell0, H = rows * cell0;
+  const cv = ctx.canvas;
+  const bw = Math.max(1, Math.round(W * dpr)), bh = Math.max(1, Math.round(H * dpr));
+  if (cv.width !== bw || cv.height !== bh) { cv.width = bw; cv.height = bh; }
+  cv.style.width = W + 'px';
+  cv.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#0d1322';
+  ctx.fillRect(0, 0, W, H);
+  const cell = Math.max(1, Math.round(cell0 - 1));
+  for (let r = 0; r < rows; r++) {
+    const row = matrix[r];
+    for (let c = 0; c < cols; c++) {
+      let v = Number(row[c]);
+      if (!Number.isFinite(v)) v = 0;
+      ctx.fillStyle = heatColor(v / norm);
+      ctx.fillRect(c * cell0, r * cell0, cell, cell);
+    }
+  }
+}
+
+function renderTouch(data) {
+  const sensors = data.sensors || {};
+  const keys = Object.keys(sensors).map(Number).sort((a, b) => a - b);
+  if (!keys.includes(Number(PALM_KEY))) keys.push(Number(PALM_KEY));
+  ensureTouchTiles(keys.map(String));
+  const meta = document.getElementById('touch-meta');
+  let active = 0;
+  for (const k of keys) {
+    const s = sensors[String(k)];
+    const tt = touchTiles.get(String(k));
+    if (!tt) continue;
+    if (!s || !Array.isArray(s.matrix) || !s.matrix.length) {
+      tt.itemEl.classList.add('nodata');
+      tt.mxEl.textContent = '—';
+      continue;
+    }
+    tt.itemEl.classList.remove('nodata');
+    active++;
+    const name = String(s.name || '');
+    if (name && tt.enEl.textContent.trim() !== name) tt.enEl.textContent = ' ' + name;
+    let frameMax = 0;
+    for (const row of s.matrix) for (const v of row) {
+      const x = Number(v);
+      if (x > frameMax) frameMax = x;
+    }
+    // 自适应色标: 峰值逐帧 0.8% 衰减 (30Hz 下约 3s 半衰), 避免单帧高值导致整体闪烁
+    const peak = Math.max(frameMax, (touchPeaks.get(String(k)) || 0) * 0.992, 8);
+    touchPeaks.set(String(k), peak);
+    tt.matrix = s.matrix; tt.peak = peak;   // 保存最近一帧, 用于缩放变化时重绘
+    drawMatrix(tt.ctx, s.matrix, peak);
+    tt.mxEl.textContent = String(frameMax);
+  }
+  const peaks = [...touchPeaks.values()];
+  document.getElementById('touch-scale').textContent =
+    `尺度 ≈ ${peaks.length ? Math.round(Math.max(...peaks)) : '—'}`;
+  meta.textContent = `${data.hand_type || ''} · ${active} 个传感器 · ${new Date().toTimeString().slice(0, 8)}`;
+}
+
+/* ---------- 波形图 (真实数据: /api/touch.mass = /cb_<hand>_hand_matrix_touch_mass 的 force[FnS]) ----------
+ * 数值: 优先 force.FnS; 协议未声明 FnS 时退回 cell_sum/cell_max (与 Qt 版一致)
+ * 波形条数: 由 mass 消息里实际出现的传感器数量决定 (不再预建固定槽位)
+ * 共用 Y 轴: 固定范围 0~3500 g (不随数据自动缩放, 超出部分截断于顶部) */
+const WAVE_HISTORY = 300;        // 30Hz × 10s 滚动窗口
+const WAVE_YMAX = 3500;          // 共用 Y 轴上限 (g), 固定不缩放
+const WAVE_HUE = { 1: 350, 2: 210, 3: 145, 4: 45, 5: 280, 6: 190 };
+const WAVE_SAT = 85;
+const waveBufs = new Map();      // key -> {buf, head, len}
+let waveSig = '';
+const waveVals = new Map();      // key -> 图例中的当前值 span
+
+/* 一个窗口: 底部图例 (色块 + 名称 + 当前值); 传感器集合变化时才重建,
+ * 并清理不在新集合里的旧槽位 (保持条数=当前传感器数) */
+function ensureWave(keys) {
+  const sig = keys.join('\u0000');
+  if (sig === waveSig) return;
+  waveSig = sig;
+  for (const k of [...waveBufs.keys()]) {
+    if (!keys.includes(k)) { waveBufs.delete(k); waveVals.delete(k); }
+  }
+  const legend = document.getElementById('wave-legend');
+  legend.innerHTML = '';
+  waveVals.clear();
+  for (const k of keys) {
+    const en = TOUCH_EN[k] || 'sensor';
+    const cn = TOUCH_CN[en] || '';
+    const hue = WAVE_HUE[k] || 210;
+    const item = document.createElement('span');
+    item.className = 'wl-item';
+    const sw = document.createElement('span');
+    sw.className = 'wl-sw';
+    sw.style.background = `hsl(${hue}, ${WAVE_SAT}%, 62%)`;
+    const val = document.createElement('span');
+    val.className = 'wl-val';
+    val.textContent = '0';
+    item.append(sw, document.createTextNode(`${TOUCH_ICON[k] || ''} ${cn} ${en} `), val);
+    legend.appendChild(item);
+    waveVals.set(k, val);
+    if (!waveBufs.has(k)) {
+      waveBufs.set(k, { buf: new Float32Array(WAVE_HISTORY), head: 0, len: 0 });
+    }
+  }
+}
+
+/* 一个传感器的合力数值: 优先 force.FnS, 缺失时退回 cell_sum/cell_max */
+function waveValFromSensor(entry) {
+  if (!entry || typeof entry !== 'object') return 0;
+  const force = (entry.force && typeof entry.force === 'object') ? entry.force : {};
+  for (const v of [force.FnS, entry.cell_sum, entry.cell_max]) {
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) return v;
+  }
+  return 0;
+}
+
+/* 无传感器数据时的占位图例 (清空全部槽位) */
+function clearWaveLegend() {
+  waveSig = '';
+  waveBufs.clear();
+  waveVals.clear();
+  document.getElementById('wave-legend').innerHTML =
+    '<span class="wl-empty">等待合力数据 (matrix_touch_mass) …</span>';
+}
+
+/* 每轮轮询: 用 mass 推进所有波形缓冲, 条数=mass 中实际传感器数 (编号升序) */
+function renderWave(mass) {
+  const sensors = (mass && mass.sensors) || {};
+  const keys = Object.keys(sensors)
+    .filter(k => /^[0-9]+$/.test(k))
+    .map(Number)
+    .sort((a, b) => a - b);
+
+  if (keys.length) {
+    ensureWave(keys.map(String));
+  } else {
+    clearWaveLegend();
+  }
+
+  for (const k of keys) {
+    const st = waveBufs.get(String(k));
+    if (!st) continue;
+    const v = waveValFromSensor(sensors[String(k)]);
+    st.buf[st.head] = v;
+    st.head = (st.head + 1) % WAVE_HISTORY;
+    st.len = Math.min(st.len + 1, WAVE_HISTORY);
+    const valEl = waveVals.get(String(k));
+    if (valEl) valEl.textContent = v.toFixed(0);
+  }
+  drawWave();
+  document.getElementById('wave-meta').textContent = keys.length
+    ? `实时 · ${keys.length} 个传感器 · FnS(g) · ${new Date().toTimeString().slice(0, 8)}`
+    : '等待合力数据…';
+}
+
+/* 单窗口滚动绘制: 共用 Y 轴, 每传感器一条线 (先全部填充, 再全部描线, 避免相互遮盖) */
+function drawWave() {
+  const cv = document.getElementById('wave-canvas');
+  const ctx = cv.getContext('2d');
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (w < 10 || h < 10) return;
+  const dpr = dprScale();
+  const bw = Math.max(1, Math.round(w * dpr)), bh = Math.max(1, Math.round(h * dpr));
+  if (cv.width !== bw || cv.height !== bh) { cv.width = bw; cv.height = bh; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  // 网格线 + Y 轴刻度 (0 在底部); 字号随显示器缩放变化
+  ctx.font = Math.round(10 * getZoomFactor()) + 'px system-ui, sans-serif';
+  for (const f of [0, 0.2, 0.4, 0.6, 0.8, 1]) {
+    const y = Math.round(h - (h - 8) * f - 4) + 0.5;
+    ctx.strokeStyle = 'rgba(120,140,180,.14)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    ctx.fillStyle = 'rgba(139,152,184,.6)';
+    ctx.textAlign = 'left';
+    ctx.fillText(String(Math.round(WAVE_YMAX * f)), 4, y - 3);
+  }
+  const dx = w / (WAVE_HISTORY - 1);
+  const keys = [...waveBufs.keys()];
+  const trace = (k) => {
+    const st = waveBufs.get(k);
+    const n = st.len;
+    if (n < 2) return false;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const idx = (st.head - n + i + WAVE_HISTORY * 8) % WAVE_HISTORY;
+      const x = w - (n - 1 - i) * dx;
+      const v = Math.min(st.buf[idx], WAVE_YMAX);
+      const y = h - (v / WAVE_YMAX) * (h - 12) - 6;
+      if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+    }
+    return true;
+  };
+  for (const k of keys) {                      // 填充层
+    const hue = WAVE_HUE[k] || 210;
+    if (!trace(k)) continue;
+    const st = waveBufs.get(k);
+    ctx.lineTo(w, h);
+    ctx.lineTo(w - (st.len - 1) * dx, h);
+    ctx.closePath();
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, `hsla(${hue}, ${WAVE_SAT}%, 62%, .10)`);
+    g.addColorStop(1, `hsla(${hue}, ${WAVE_SAT}%, 62%, .01)`);
+    ctx.fillStyle = g;
+    ctx.fill();
+  }
+  for (const k of keys) {                      // 曲线层
+    const hue = WAVE_HUE[k] || 210;
+    if (!trace(k)) continue;
+    ctx.strokeStyle = `hsl(${hue}, ${WAVE_SAT}%, 62%)`;
+    ctx.lineWidth = 1.6;
+    ctx.stroke();
+  }
+}
+
+
+
+async function pollTouch() {
+  try {
+    const r = await fetch('/api/touch', { cache: 'no-store' });
+    const d = await r.json();
+    if (d && d.ok) {
+      if (d.connected && d.data && d.data.sensors) {
+        renderTouch(d.data);
+      } else {
+        document.getElementById('touch-meta').textContent =
+          '等待触觉数据 (驱动未发布触觉?)…';
+      }
+      renderWave(d.mass);   // 波形: 真实数据, 条数随 mass 中的传感器数
+    }
+  } catch (e) { /* 断连/节点重启时保持上次显示 */ }
+}
+/* 初始槽位预留: 五指 + 手掌 (首帧数据到达后按实际传感器集合调整) */
+ensureTouchTiles(['1', '2', '3', '4', '5', '6']);
+pollTouch();
+setInterval(pollTouch, TOUCH_POLL_MS);
+
+/* ---------- 命令下发 (拖动实时 + 30Hz 限流) ---------- */
+async function publish(final) {
+  const positions = jointNames.map(n => Number(sliders.get(n).input.value));
+  try {
+    const res = await fetch('/api/cmd', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ positions }),
+    });
+    const data = await res.json().catch(() => ({ ok: res.ok, message: '' }));
+    if (!res.ok || !data.ok) {
+      log(`⚠️ 下发失败: ${data.message || res.status}`, 'err');
+    } else {
+      document.getElementById('upd').textContent = `最后下发: ${ts()}`;
+      if (final) log(`下发指令: [${positions.join(',')}]`, 'cmd');
+    }
+  } catch (e) {
+    log(`⚠️ 下发异常: ${e}`, 'err');
+  }
+}
+function schedulePublish(final) {
+  if (!controlOn) return;   // 关闭控制模式: 不主动下发, 只回显
+  const now = performance.now();
+  const doSend = () => { pubQueued = false; lastPub = performance.now(); publish(final); };
+  if (final || now - lastPub > 33) doSend();
+  else if (!pubQueued) { pubQueued = true; setTimeout(doSend, 40); }
+}
+/* 同步给 URDF 3D 查看器 (module 脚本读取 window.handState) */
+function pushViewerState() {
+  window.handState = {
+    names: jointNames.slice(),
+    values: jointNames.map(n => Number(sliders.get(n).input.value)),
+  };
+}
+/* ---------- 关节控制开关: 开启=30Hz持续下发, 关闭=30Hz监听回显 /cb_<hand>_hand_control_cmd ---------- */
+const jcCtrlBtn = document.getElementById('jc-ctrl');
+function publishLoop() {
+  if (!slidersBuilt) return;
+  publish(false);                              // 30Hz 持续下发当前滑动条值
+}
+let urdf2state = {};         // 命令话题(URDF)关节名 -> 滑动条(状态)关节名, 来自 /api/joints 的 reverse
+let urdf2stateLoaded = false;
+async function loadUrdf2State() {
+  if (urdf2stateLoaded) return;
+  try {
+    const r = await fetch('/api/joints', { cache: 'no-store' });
+    const d = await r.json();
+    if (d && d.ok && Array.isArray(d.joints)) {
+      for (const j of d.joints) {
+        if (j && j.urdf && j.state) urdf2state[j.urdf] = j.state;
+      }
+      urdf2stateLoaded = true;
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+async function pollCmdLoop() {
+  if (!slidersBuilt) return;
+  loadUrdf2State();
+  try {
+    const r = await fetch('/api/cmd_state', { cache: 'no-store' });
+    const d = await r.json();
+    if (!(d && d.ok && Array.isArray(d.names) && d.names.length)) return;
+    const sliderSet = new Set(sliders.keys());
+    let changed = false;
+    for (let i = 0; i < d.names.length; i++) {
+      const n = d.names[i], v = (d.positions && d.positions[i]);
+      if (n === undefined || !Number.isFinite(v)) continue;
+      let sn;
+      if (sliderSet.has(n)) {
+        sn = n;                                             // 命令用状态名 (如 web 自身下发时)
+      } else if (urdf2state[n] && sliderSet.has(urdf2state[n])) {
+        sn = urdf2state[n];                                 // 命令用 URDF 名 -> 映射回状态名
+      } else {
+        continue;                                            // 未知关节名, 跳过
+      }
+      const s = sliders.get(sn);
+      const t = String(Math.round(v));
+      if (s.input.value !== t) {
+        s.input.value = t;
+        s.num.textContent = t;
+        changed = true;
+      }
+    }
+    if (changed) pushViewerState();
+  } catch (e) { /* 断连时保持上次显示 */ }
+}
+function applyCtrlState() {
+  jcCtrlBtn.textContent = controlOn ? '已开启控制' : '已关闭控制';
+  jcCtrlBtn.className = 'jc-ctrl ' + (controlOn ? 'on' : 'off');
+  if (ctrlTimer) clearInterval(ctrlTimer);
+  ctrlTimer = setInterval(controlOn ? publishLoop : pollCmdLoop, CTRL_PERIOD_MS);
+}
+jcCtrlBtn.addEventListener('click', () => {
+  controlOn = !controlOn;
+  applyCtrlState();
+});
+applyCtrlState();                               // 初始即开启控制, 启动 30Hz 循环
+
+
+/* ---------- SSE (仅用于连接状态指示灯; 不获取关节数据, 滑动条只下发) ---------- */
+const es = new EventSource('/api/stream');
+es.onopen = () => { setConn(true); log('已连接到节点 (SSE)', 'ok'); };
+es.onerror = () => setConn(false);
+
+/* ---------- 初始化: 拉一次状态接口显示手部类型 ---------- */
+fetch('/api/status').then(r => r.json()).then(d => {
+  if (d && d.hand) document.getElementById('hand').textContent = `手部: ${d.hand}`;
+}).catch(() => {});
+
+/* ---------- 显示器缩放: 窗口 / 缩放比 (dpr) 变化时应用 zoom 并重绘热力图/波形,
+   字体与间距跟随缩放 (置于所有渲染函数定义之后, 避免 TDZ) ---------- */
+function applyDisplayZoom() {
+  document.documentElement.style.setProperty('--zoom', getZoomFactor().toFixed(4));
+  for (const tt of touchTiles.values()) {
+    if (tt.matrix && tt.matrix.length) drawMatrix(tt.ctx, tt.matrix, tt.peak);
+    else setTileCanvasSize(tt.canvas, 7, 10);
+  }
+  drawWave();
+}
+let zoomTimer;
+window.addEventListener('resize', () => {
+  clearTimeout(zoomTimer);
+  zoomTimer = setTimeout(applyDisplayZoom, 80);
+});
+/* 显示器缩放 (devicePixelRatio) 变化监听:
+   系统缩放调整 / 浏览器 Ctrl+缩放 / 跨显示器拖动窗口时, innerWidth 可能不变、
+   resize 不触发, 但 dpr 已变 → 画布需按新分辨率重绘。
+   用 (resolution: Xdppx) 媒体查询即时感知, 另加 1s 轮询兜底 (个别环境不发该事件)。 */
+let lastDpr = window.devicePixelRatio;
+function onDprChanged() {
+  const d = window.devicePixelRatio;
+  if (d === lastDpr) return;
+  lastDpr = d;
+  applyDisplayZoom();
+}
+if (window.matchMedia && typeof matchMedia('(resolution: 1dppx)').addEventListener === 'function') {
+  let dprMq = matchMedia(`(resolution: ${lastDpr}dppx)`);
+  const dprMqHandler = () => {
+    const next = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    dprMq.removeEventListener('change', dprMqHandler);
+    next.addEventListener('change', dprMqHandler);
+    dprMq = next;
+    onDprChanged();
+  };
+  dprMq.addEventListener('change', dprMqHandler);
+}
+setInterval(onDprChanged, 1000);
+applyDisplayZoom();
+</script>
+<script>
+/* 3D 查看器看门狗: 模块 20 秒内未就绪 (加载失败/浏览器过旧/WebGL 缺失) 则给出诊断 */
+(function () {
+  var st = document.getElementById('urdf-status');
+  var missing = [];
+  try {
+    if (!HTMLScriptElement.supports || !HTMLScriptElement.supports('importmap')) missing.push('importmap');
+  } catch (e) { missing.push('importmap'); }
+  if (!('ResizeObserver' in window)) missing.push('ResizeObserver');
+  try {
+    var c = document.createElement('canvas');
+    if (!(c.getContext('webgl2') || c.getContext('webgl'))) missing.push('WebGL');
+  } catch (e) { missing.push('WebGL'); }
+  setTimeout(function () {
+    if (window.__hand_viewer_ok === true) return;          // 正常
+    if (window.__hand_viewer_ok === 'error') return;       // 模块已给出具体错误
+    st.textContent = missing.length
+      ? '当前浏览器缺少 3D 所需特性: ' + missing.join('、') + ' — 请升级 Edge/Chrome, 或换用最新版 Chrome 打开'
+      : '3D 模块 20 秒内未就绪 — 请按 F12 查看控制台报错';
+    st.className = 'err';
+  }, 20000);
+})();
+</script>
+<script type="module" src="/js/urdf_viewer.js"></script>
+</body>
+</html>

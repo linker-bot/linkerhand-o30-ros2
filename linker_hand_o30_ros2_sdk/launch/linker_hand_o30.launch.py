@@ -34,7 +34,7 @@ def generate_launch_description():
                 'cmd_timeout': 0.0,       # 秒；<=0 关闭。上层失联超过该时间即执行 deadman_action
                 'deadman_action': 'hold', # hold(保持) | open(伸直五指) | disable(失能)
                 # ---- 频率与诊断 ----
-                'state_rate': 40.0,       # 状态发布/命令下发频率 Hz
+                'state_rate': 50.0,       # 状态发布/命令下发频率 Hz
                 'touch_rate': 31.0,       # 触觉发布频率 Hz（独立线程；实测值见 info 的 touch_hz）
                 'touch_fingers': [1, 2, 3, 4, 5], # 要读的传感器 1拇指~5小指(6手掌本机无)；少读几指才能上高频
                 'touch_publish_matrix': True,     # False 时只发合力话题，省一半 JSON 序列化

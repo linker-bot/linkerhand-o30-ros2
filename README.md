@@ -34,6 +34,7 @@ O30 为 **20 自由度** 灵巧手，采用 **HOP (Hand Object Protocol)** CANFD
 * **诊断话题**：温度、电流、关节故障、通信错误码、在线状态、实测发布频率一并发布。
 * **触觉 30 Hz**：五指指尖 10×7 点阵 + 合力，（见 [7.5](#75-触觉发布频率)）。
 * **GUI 调试界面**：20 个关节滑块、预设手势、速度/力矩设置。
+* **Web 控制台**：20 关节滑动条（拖动实时下发）+ 温度 + 触觉热力图 + 合力波形 + URDF 3D 显示，单命令启动（见 [6.5](#65-启动-web-控制台-web_control)）。
 * **无硬件自检脚本**：不接设备即可回归安全逻辑（见 [8](#8-自检与测试)）。
 
 ## 1.2 仓库结构
@@ -46,6 +47,7 @@ O30 为 **20 自由度** 灵巧手，采用 **HOP (Hand Object Protocol)** CANFD
 | `linker_hand_o30_ros2_sdk/launch/` | 单手 `linker_hand_o30.launch.py`、双手 `linker_hand_o30_double.launch.py` |
 | `linker_hand_o30_ros2_sdk/test/node_safety_check.py` | 无硬件打桩自检脚本 |
 | `gui_control/` | GUI 调试界面包 |
+| `web_control/` | Web 控制台包（HTTP + SSE + three.js）：关节滑动条 + 温度 + 触觉热力图 + 合力波形 + URDF 3D 显示 |
 | `99-canfd.rules` / `99-double-canfd.rules` | CANFD 设备 udev 权限规则（单手 / 同总线双手） |
 | `libcanbus*.tar` | 各架构 `libcanbus` 私有库（仅 `comm_type=libcanbus` 需要） |
 | `requirements.txt` | Python 依赖 |
@@ -337,6 +339,77 @@ GUI 提供 20 个关节滑块、预设动作按钮（握拳 / 张开 / 数字手
 
 <img src="resource/gui.png" width="550">
 
+## 6.5 启动 Web 控制台 (web_control)
+
+`web_control` 是一个独立的 Web 控制台包：内置标准库 HTTP 服务器（零第三方依赖），
+订阅 `/cb_<hand>_hand_state`、发布 `/cb_<hand>_hand_control_cmd`，并在浏览器中提供
+关节控制与实时可视化。**关节名 / 数量 / 状态名→URDF 映射均自适应**（来自状态话题
+与 URDF 自动推导，无需为每个型号改代码）。
+URDF根据手编号第二组确定版本，如LHO30-03.4-0017-L-J-3-A。则使用03.4版本URDF。不可通用。
+将URDF放到`src\web_control\web_control\urdf\O30\left|right目录中
+
+先按 [6.4](#64-启动-gui-控制-o30-灵巧手) 启动 SDK 让灵巧手上线，再新开一个终端：
+
+```bash
+$ source ./install/setup.bash
+
+# 默认控制左手（hand:=left）、URDF 自动匹配（model:=auto）
+$ ros2 launch web_control web_control.launch.py
+
+# 控制右手
+$ ros2 launch web_control web_control.launch.py hand:=right
+
+# 显式指定 URDF 型号子目录
+$ ros2 launch web_control web_control.launch.py model:=O30
+
+# 更换 URDF 根目录（默认指向 web_control 包内置的 urdf 目录，即“现在的目录”）
+$ ros2 launch web_control web_control.launch.py urdf_path:=/path/to/your/urdf
+```
+
+> 端口无需指定：节点从 `8090` 起自动探测空闲端口（范围 `8090 ~ 8189`），被占用自动
+> 顺延（`8091`、`8092` …）。终端会打印访问地址，例如 `http://127.0.0.1:8090`（本机）
+> 与 `http://192.168.x.x:8090`（局域网）。用带图形界面的浏览器打开即可。
+
+启动参数（可写在 `web_control/launch/web_control.launch.py` 或在命令行传递）：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `hand` | `left` | 手部类型 `left` / `right`（小写），决定订阅 / 发布的话题前缀 `/cb_<hand>_hand_*` |
+| `model` | `auto` | URDF 型号子目录；`auto` 时从 `/cb_<hand>_hand_info` 的 `model` 模糊匹配，唯一时自动选用 |
+| `urdf_path` | 包内置 `urdf` 目录 | URDF 根目录；默认指向 `web_control` 包内置的 `urdf` 目录（“现在的目录”），留空即此默认；填绝对路径即可随时更换型号 / 版本，例如 `urdf_path:=/path/to/urdf` |
+| `host` | `0.0.0.0` | HTTP 监听地址 |
+
+节点另有命令行选项：`--urdf-path`（URDF 根目录，留空 = 包内置 `urdf` 目录）、`--stream-hz`（SSE 推送频率，默认 15）与 `--html`（自定义页面路径）。
+
+页面功能：
+
+* **关节滑动条**：20 个关节（0 ~ 255），拖动实时下发控制命令，前端限频约 30 Hz。
+* **温度显示**：1 Hz 轮询，超过 80 °C 标红。
+* **触觉矩阵热力图**：~30 Hz 轮询，每指独立自适应色标，手掌槽位（编号 6）始终预留。
+* **合力波形图**：10 秒滚动窗口，各指 `FnS` 实时曲线，底部图例显示当前值。
+* **URDF 3D 显示**：three.js + STL 模型实时跟随当前关节位置，支持鼠标旋转 / 缩放。
+* **连接状态灯 + 操作日志**：SSE 连接指示与命令下发记录。
+
+内置 HTTP 接口（可直接用浏览器或脚本调用，方便二次开发）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/` | 控制台页面 |
+| GET | `/api/status` | 节点状态（手部 / 连接 / 关节名与位置 / 命令计数） |
+| GET | `/api/info` | 各关节温度与过温关节列表 |
+| GET | `/api/touch` | 最新触觉点阵（`data`）与合力 / 统计（`mass`） |
+| GET | `/api/stream` | SSE 实时状态流（前端连接指示灯使用） |
+| GET | `/api/urdf` / `/api/joints` | URDF 文档 / 关节元信息 |
+| GET | `/api/mesh/<rel>` | 按相对路径返回 STL 网格 |
+| POST | `/api/cmd` | `{"positions":[...]}` 发布位置命令（0 ~ 255，数量须等于状态话题关节数） |
+
+> 使用提示：3D 显示依赖 `three.js` 与 WebGL，请用现代浏览器（Chrome / Edge，支持
+> importmap）打开；`POST /api/cmd` 的 `positions` 数量必须等于 `/cb_<hand>_hand_state.position`
+> 的长度，且节点尚未收到状态消息时会拒绝下发，以避免给硬件错误的关节数。
+
+<img src="resource/web_control.png" width="550">
+
+
 # 7. Topic 说明
 
 SDK 按 `hand_type` 动态生成话题名（下表以左手 `left` 为例，右手将 `left` 替换为 `right`）。触觉相关话题仅在 `is_touch=True` 时创建。
@@ -488,7 +561,40 @@ $ ros2 topic hz /cb_right_hand_matrix_touch_mass
 `touch_hz` / `state_hz` 低于设定值 80% 时终端也会给出降频提示（10 秒限流）。
 
 
-# 8. 已知限制
+# 8. 自检与测试
+
+`test/node_safety_check.py` 是**无硬件**的回归自检脚本：用打桩的假控制器替代真机与 CANFD
+总线，直接调用驱动节点内部逻辑，在**不接设备、不上总线**的前提下验证安全链路是否正确。
+它不占用真机、不会被 pytest 自动收集，也**无需先 `colcon build`**（直接从源码树导入被测节点）。
+脚本以 `hand_type="test"`（话题前缀 `/cb_test_hand_*`）运行，与真机 `left` / `right` 话题
+完全隔开，即使真机正在运行也不会互相干扰。
+
+运行（仅需源码树与 ROS 2 环境）：
+
+```bash
+$ source /opt/ros/<distro>/setup.bash
+$ cd src/linkerhand-o30-ros2
+$ python3 test/node_safety_check.py
+```
+
+覆盖的主要安全项（对应 SDK 的 P0 安全需求）：
+
+1. **上电校验先行**：产品型号 / 左右手 / 协议核对 + 关节故障检查全部通过才允许运动；
+   任一失败则打印原因后退出，不建话题、不起控制线程。
+2. **双手命令隔离**：设置命令按 `params.hand_type` 分派，单手话题隔离，左右手互不干扰。
+3. **输入校验与限位**：控制命令长度（20 个，或 1 个广播）、`NaN` / `Inf` 拒绝、
+   `joint_limit_min` / `joint_limit_max` 截断。
+4. **deadman 看门狗**：`cmd_timeout > 0` 时 `hold` / `open` / `disable` 三种失联处置正确触发。
+5. **诊断与触觉发布**：`/cb_*_hand_info`（温度 / 电流 / 故障 / 在线 / deadman / 实测频率）、
+   触觉点阵与合力话题的字段完整。
+6. **状态发布完整性**：`/cb_*_hand_state` 的 `position` / `velocity` / `effort` 与控制器读取值一致。
+7. **关闭顺序**：`close()` 先等待触觉线程退出，再关闭总线。
+8. **控制线程抗异常**：发布循环中抛出异常不会导致线程退出，控制持续读取。
+
+全部通过时终端打印 `失败 0 项：全部通过 ✅` 并以退出码 `0` 结束；任一失败会列出失败项
+并以 `1` 结束，可用于 CI 回归。
+
+# 9. 已知限制
 
 * **手掌触觉**：本机未安装手掌传感器（编号 6），`touch_fingers` 里填 6 会在启动时被剔除并告警。
 * **实时电流 / 速度未标定**：`current` / `velocity` 为原始值，`255` 不代表堵转，部分关节恒为 0；
@@ -499,7 +605,7 @@ $ ros2 topic hz /cb_right_hand_matrix_touch_mass
 * **弧度接口**：驱动只收发 `0~255` 单字节，弧度换算由上层 / GUI 完成（见 [第 4 节](#4-o30-关节说明)）。
 * **GUI**：不含触觉可视化界面，触觉数据请用 `ros2 topic echo` 或自行订阅。
 
-# 9. 常见问题 (FAQ)
+# 10. 常见问题 (FAQ)
 
 * **未找到 CANFD 设备 / 打开设备失败**（libcanbus）：确认已按 5.2 安装 `libcanbus.so` 并设置 `LD_LIBRARY_PATH`，检查设备权限（udev 规则）。
 * **未找到网络接口 can0**（socketcan）：确认 type-c 下方开关拨到 Linux 模式并重新插拔 USB，用 `ip -br link show type can` 确认接口出现。
@@ -519,7 +625,7 @@ $ ros2 topic hz /cb_right_hand_matrix_touch_mass
   `/cb_<left|right>_hand_setting_cmd`；`libcanbus` 后端还要确认两只手的 `canfd_device` 与帧 ID 不冲突。
 * **GUI 无法启动**：确认使用带图形界面的终端（非纯 SSH），依赖 `pyqt5` 已安装。
 
-# 10. 许可证
+# 11. 许可证
 
 本项目以 [Apache License 2.0](LICENSE) 开源，版权归 灵心巧手(北京)科技有限公司 所有。
 
