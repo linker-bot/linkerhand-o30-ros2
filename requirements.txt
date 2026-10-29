@@ -3,3 +3,5 @@ python-can        # socketcan 后端（comm_type=socketcan）；libcanbus 后端
 pyqt5             # gui_control 调试界面
 tabulate          # 终端表格（产品信息、关节故障打印）
 wcwidth           # 中英混排对齐
+pyqtgraph
+numpy
